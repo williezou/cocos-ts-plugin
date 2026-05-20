@@ -1,0 +1,43 @@
+{
+  "name": "cocos-ts-plugin",
+  "version": "0.1.0",
+  "description": "TypeScript Language Service plugin that resolves `this.xxx` inside cocos2d-x / cocos2d-html5 cc.Class.extend({...}) literals — providing Go to Definition and hover info that tsserver alone can't compute.",
+  "keywords": [
+    "typescript",
+    "ts-plugin",
+    "language-service",
+    "cocos2d-x",
+    "cocos2d-html5",
+    "vscode",
+    "intellisense"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/williezou/cocos-ts-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/williezou/cocos-ts-plugin/issues"
+  },
+  "homepage": "https://github.com/williezou/cocos-ts-plugin#readme",
+  "author": "Willie Zou",
+  "license": "MIT",
+  "peerDependencies": {
+    "typescript": ">=4.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}
