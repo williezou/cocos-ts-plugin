@@ -71,8 +71,8 @@ function init(modules: { typescript: typeof tslib }) {
                 if (original && original.definitions && original.definitions.length > 0) {
                     return original;
                 }
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, getExpandoIndex, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, getExpandoIndex, fileName, position);
                 if (ctx) {
                     log(`def: resolved ${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
                     return buildDefinition(ts, ctx);
@@ -95,8 +95,8 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getDefinitionAtPosition", () => {
                 const original = ls.getDefinitionAtPosition(fileName, position);
                 if (original && original.length > 0) return original;
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, getExpandoIndex, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, getExpandoIndex, fileName, position);
                 if (ctx) {
                     return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
                 }
@@ -115,8 +115,8 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getQuickInfoAtPosition", () => {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
                 if (original && !isAnyQuickInfo(ts, original)) return original;
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, getExpandoIndex, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, getExpandoIndex, fileName, position);
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
                     return buildQuickInfo(ts, ls, ctx) ?? original;
@@ -197,10 +197,15 @@ interface ThisMemberContext {
     sourceFile: tslib.SourceFile;
     identifier: tslib.Identifier;
     memberName: string;
-    property: tslib.ObjectLiteralElementLike;
+    /** Optional — present for extend-literal hits, absent for synthesized hits from
+     * the expando index. Builders should prefer the dedicated `propertyNameNode` and
+     * `valueNode` fields below. */
+    property?: tslib.ObjectLiteralElementLike;
     propertyNameNode: tslib.Node;
-    /** Where `property` lives — same as `sourceFile` for own members, different for inherited. */
+    /** Where the definition lives — may differ from `sourceFile` for inherited members. */
     propertySourceFile: tslib.SourceFile;
+    /** RHS / initializer used by buildQuickInfo for type / signature inference. */
+    valueNode?: tslib.Expression;
 }
 
 interface ExtendMemberContext {
@@ -492,6 +497,7 @@ function locateThisMember(
     ts: typeof tslib,
     ls: tslib.LanguageService,
     getIndex: () => ExtendIndex,
+    getExpandoIndex: () => ExpandoIndex,
     fileName: string,
     position: number
 ): ThisMemberContext | undefined {
@@ -512,9 +518,9 @@ function locateThisMember(
     if (!literal) return undefined;
 
     const memberName = node.text;
-    const hit = lookupInLiteralAndChain(ts, getIndex, literal, memberName);
+    const hit = lookupInLiteralAndChain(ts, getIndex, literal, memberName, getExpandoIndex);
     if (!hit) return undefined;
-    return makeContext(sourceFile, node, memberName, hit.property, hit.propertySourceFile);
+    return makeContext(sourceFile, node, memberName, hit);
 }
 
 /**
@@ -678,6 +684,7 @@ function locateChainedMember(
     ls: tslib.LanguageService,
     getIndex: () => ExtendIndex,
     getProtoIndex: () => PrototypeIndex,
+    getExpandoIndex: () => ExpandoIndex,
     fileName: string,
     position: number
 ): ThisMemberContext | undefined {
@@ -703,10 +710,15 @@ function locateChainedMember(
     const entries = getIndex().get(className);
     if (!entries || entries.length === 0) return undefined;
     for (const entry of entries) {
-        const hit = lookupInLiteralAndChain(ts, getIndex, entry.literal, memberName);
+        const hit = lookupInLiteralAndChain(ts, getIndex, entry.literal, memberName, getExpandoIndex);
         if (hit) {
-            return makeContext(sourceFile, node, memberName, hit.property, hit.propertySourceFile);
+            return makeContext(sourceFile, node, memberName, hit);
         }
+    }
+    // Fallback: maybe the member lives directly as an expando on `className` itself.
+    const expandoOnClass = expandoHit(getExpandoIndex(), className, memberName);
+    if (expandoOnClass) {
+        return makeContext(sourceFile, node, memberName, expandoOnClass);
     }
     return undefined;
 }
@@ -730,12 +742,8 @@ function resolveReceiverToClass(
         const literal = findEnclosingExtendLiteral(ts, receiver);
         if (literal) {
             const hit = lookupInLiteralAndChain(ts, getExtendIndex, literal, memberName);
-            if (hit && ts.isPropertyAssignment(hit.property)) {
-                const cls = extractClassFromInitializer(
-                    ts,
-                    hit.property.initializer,
-                    getExtendIndex
-                );
+            if (hit && hit.valueNode) {
+                const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex);
                 if (cls) return cls;
             }
         }
@@ -844,34 +852,47 @@ function lookupClassName(index: ExtendIndex, name: string): string | undefined {
 }
 
 interface LiteralHit {
-    property: tslib.ObjectLiteralElementLike;
+    /** Either an extend-literal property OR an expando-style synthetic hit. */
+    property?: tslib.ObjectLiteralElementLike;
+    nameNode: tslib.Node;
+    valueNode?: tslib.Expression;
     propertySourceFile: tslib.SourceFile;
 }
 
 /**
  * Searches `literal` for a property named `memberName`. If not found, walks up the
- * extend chain (via the literal's owner's parentName, looked up in the index).
+ * extend chain (via the literal's owner's parentName, looked up in the index). At
+ * each step the expando index is also consulted under key `<className>.<memberName>`
+ * so that auto-api stubs (`cc.Node = { foo: function(){...} }`) augment the chain.
  */
 function lookupInLiteralAndChain(
     ts: typeof tslib,
     getIndex: () => ExtendIndex,
     literal: tslib.ObjectLiteralExpression,
-    memberName: string
+    memberName: string,
+    getExpandoIndex?: () => ExpandoIndex
 ): LiteralHit | undefined {
     const direct = findPropertyByName(ts, literal, memberName);
     if (direct) {
-        return { property: direct, propertySourceFile: literal.getSourceFile() };
+        return hitFromProperty(direct, literal.getSourceFile());
     }
     const owner = getLiteralOwner(ts, literal);
-    if (!owner || !owner.parentName) return undefined;
-    return walkChain(ts, getIndex, owner.parentName, memberName);
+    if (!owner) return undefined;
+    // Check expando for the current class first (e.g., own class's auto-api stub).
+    if (getExpandoIndex) {
+        const ownHit = expandoHit(getExpandoIndex(), owner.className, memberName);
+        if (ownHit) return ownHit;
+    }
+    if (!owner.parentName) return undefined;
+    return walkChain(ts, getIndex, owner.parentName, memberName, getExpandoIndex);
 }
 
 function walkChain(
     ts: typeof tslib,
     getIndex: () => ExtendIndex,
     startParent: string,
-    memberName: string
+    memberName: string,
+    getExpandoIndex?: () => ExpandoIndex
 ): LiteralHit | undefined {
     const index = getIndex();
     const seen = new Set<string>();
@@ -879,34 +900,71 @@ function walkChain(
     while (parentName && !seen.has(parentName)) {
         seen.add(parentName);
         const entries = index.get(parentName);
-        if (!entries || entries.length === 0) return undefined;
-        for (const entry of entries) {
-            const prop = findPropertyByName(ts, entry.literal, memberName);
-            if (prop) {
-                return { property: prop, propertySourceFile: entry.sourceFile };
+        if (entries && entries.length > 0) {
+            for (const entry of entries) {
+                const prop = findPropertyByName(ts, entry.literal, memberName);
+                if (prop) return hitFromProperty(prop, entry.sourceFile);
             }
         }
-        parentName = entries[0].parentName;
+        // Fall through to expando: covers `cc.Node = { setCameraMask: ... }` stubs.
+        if (getExpandoIndex) {
+            const eHit = expandoHit(getExpandoIndex(), parentName, memberName);
+            if (eHit) return eHit;
+        }
+        parentName = entries?.[0]?.parentName;
     }
     return undefined;
+}
+
+function hitFromProperty(
+    prop: tslib.ObjectLiteralElementLike,
+    sf: tslib.SourceFile
+): LiteralHit {
+    const nameNode: tslib.Node = (prop as any).name ?? prop;
+    const valueNode: tslib.Expression | undefined =
+        // Best-effort value node for hover type inference.
+        (prop as any).initializer ?? undefined;
+    return { property: prop, nameNode, valueNode, propertySourceFile: sf };
+}
+
+function expandoHit(
+    expando: ExpandoIndex,
+    className: string,
+    memberName: string
+): LiteralHit | undefined {
+    const entries = expando.get(`${className}.${memberName}`);
+    if (!entries || entries.length === 0) return undefined;
+    const e = entries[0];
+    return {
+        nameNode: e.nameNode,
+        valueNode: e.initializer,
+        propertySourceFile: e.sourceFile,
+    };
 }
 
 function makeContext(
     sourceFile: tslib.SourceFile,
     identifier: tslib.Identifier,
     memberName: string,
-    property: tslib.ObjectLiteralElementLike,
-    propertySourceFile: tslib.SourceFile
+    hit: LiteralHit
 ): ThisMemberContext {
-    const propertyNameNode = (property as any).name ?? property;
     return {
         sourceFile,
         identifier,
         memberName,
-        property,
-        propertyNameNode,
-        propertySourceFile,
+        property: hit.property,
+        propertyNameNode: hit.nameNode,
+        valueNode: hit.valueNode ?? extractValueNode(hit.property),
+        propertySourceFile: hit.propertySourceFile,
     };
+}
+
+function extractValueNode(
+    prop: tslib.ObjectLiteralElementLike | undefined
+): tslib.Expression | undefined {
+    if (!prop) return undefined;
+    if ((prop as any).initializer) return (prop as any).initializer;
+    return undefined;
 }
 
 function getLiteralOwner(
@@ -1341,40 +1399,33 @@ function buildQuickInfo(
     if (!program) return undefined;
     const checker = program.getTypeChecker();
 
-    const { sourceFile, identifier, memberName, property } = ctx;
+    const { sourceFile, identifier, memberName, property, valueNode } = ctx;
 
     const sourceStart = identifier.getStart(sourceFile);
     const sourceLength = identifier.getEnd() - sourceStart;
 
-    let kind: tslib.ScriptElementKind;
-    let label: string;
-    let typeStr: string;
+    let kind: tslib.ScriptElementKind = ts.ScriptElementKind.memberVariableElement;
+    let label = "(property) ";
+    let typeStr = "any";
 
-    if (ts.isMethodDeclaration(property)) {
+    if (property && ts.isMethodDeclaration(property)) {
         const sig = checker.getSignatureFromDeclaration(property);
         typeStr = sig ? checker.signatureToString(sig) : "(...args: any[]) => any";
         kind = ts.ScriptElementKind.memberFunctionElement;
         label = "(method) ";
-    } else if (ts.isPropertyAssignment(property)) {
-        const init = property.initializer;
-        if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) {
-            const sig = checker.getSignatureFromDeclaration(init);
+    } else if (valueNode) {
+        if (ts.isFunctionExpression(valueNode) || ts.isArrowFunction(valueNode)) {
+            const sig = checker.getSignatureFromDeclaration(valueNode);
             typeStr = sig ? checker.signatureToString(sig) : "(...args: any[]) => any";
             kind = ts.ScriptElementKind.memberFunctionElement;
             label = "(method) ";
         } else {
-            const t = checker.getTypeAtLocation(init);
+            const t = checker.getTypeAtLocation(valueNode);
             typeStr = checker.typeToString(t);
-            kind = ts.ScriptElementKind.memberVariableElement;
-            label = "(property) ";
         }
-    } else if (ts.isShorthandPropertyAssignment(property)) {
+    } else if (property && ts.isShorthandPropertyAssignment(property)) {
         const t = checker.getTypeAtLocation(property.name);
         typeStr = checker.typeToString(t);
-        kind = ts.ScriptElementKind.memberVariableElement;
-        label = "(property) ";
-    } else {
-        return undefined;
     }
 
     const displayParts: tslib.SymbolDisplayPart[] = [
@@ -1389,7 +1440,7 @@ function buildQuickInfo(
         kindModifiers: "",
         textSpan: { start: sourceStart, length: sourceLength },
         displayParts,
-        documentation: extractJSDocAsParts(ts, property),
+        documentation: property ? extractJSDocAsParts(ts, property) : [],
         tags: [],
     };
 }
