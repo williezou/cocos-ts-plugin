@@ -270,6 +270,17 @@ export function collectMemberCompletions(
         }
     }
 
+    // 2c. Call result (`this.activityInfo().`) — receiver is a CallExpression.
+    if (ts.isCallExpression(receiver)) {
+        const className = resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex, receiver, getExpandoIndex, getIdentifierIndex
+        );
+        if (className) {
+            enumerateClass(ts, getExtendIndex, getProtoIndex, className, push);
+            return out;
+        }
+    }
+
     // 3. `<dotted-class>.` — direct class members + expando children
     const dottedName = expressionToName(ts, receiver);
     if (dottedName) {

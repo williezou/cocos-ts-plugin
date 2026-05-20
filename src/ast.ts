@@ -269,6 +269,53 @@ export function isWriteAccessOfPropertyAccess(
     return false;
 }
 
+/**
+ * Returns the first non-nested `return <expr>` expression in `fn`'s body. Used
+ * to infer the type a function produces when we know its identity but tsserver
+ * has lost the connection (e.g., methods stored as `this.foo = function () {...}`).
+ * Bails out on inner functions/arrows so we don't pick up returns from callbacks.
+ */
+export function findFirstReturnExpression(
+    ts: typeof tslib,
+    fn: tslib.Node
+): tslib.Expression | undefined {
+    if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) {
+        return fn.body;
+    }
+    if (
+        !ts.isFunctionExpression(fn) &&
+        !ts.isFunctionDeclaration(fn) &&
+        !ts.isArrowFunction(fn)
+    ) {
+        return undefined;
+    }
+    const body = (fn as tslib.FunctionLikeDeclaration).body;
+    if (!body || !ts.isBlock(body)) return undefined;
+
+    let result: tslib.Expression | undefined;
+    function visit(node: tslib.Node): void {
+        if (result) return;
+        if (
+            ts.isFunctionExpression(node) ||
+            ts.isArrowFunction(node) ||
+            ts.isFunctionDeclaration(node)
+        ) {
+            return; // don't descend into nested functions
+        }
+        if (ts.isReturnStatement(node) && node.expression) {
+            result = node.expression;
+            return;
+        }
+        ts.forEachChild(node, visit);
+    }
+    ts.forEachChild(body, visit);
+    return result;
+}
+
+export function isFunctionLike(ts: typeof tslib, node: tslib.Node): boolean {
+    return ts.isFunctionExpression(node) || ts.isArrowFunction(node);
+}
+
 export function addToIndex<T>(index: Map<string, T[]>, key: string, entry: T): void {
     let arr = index.get(key);
     if (!arr) {

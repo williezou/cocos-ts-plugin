@@ -3,11 +3,13 @@ import {
     expressionToName,
     extractValueNode,
     findEnclosingExtendLiteral,
+    findFirstReturnExpression,
     findNodeAtPosition,
     findPrototypeOwnerClass,
     findPropertyByName,
     getLiteralOwner,
     isExtendCall,
+    isFunctionLike,
 } from "./ast";
 import type {
     DottedAccessHit,
@@ -356,6 +358,91 @@ export function resolveReceiverToClass(
                 if (cls) return cls;
             }
         }
+    }
+
+    // Case E: <callee>(...) — receiver is a call. Find the function being
+    // called, then recursively resolve the class of its first `return` value.
+    if (ts.isCallExpression(receiver)) {
+        const valueNode = findReceiverValueNode(
+            ts, receiver.expression, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex
+        );
+        if (valueNode && isFunctionLike(ts, valueNode)) {
+            const retExpr = findFirstReturnExpression(ts, valueNode);
+            if (retExpr) {
+                return resolveReceiverToClass(
+                    ts, getExtendIndex, getProtoIndex, retExpr, getExpandoIndex, getIdentifierIndex
+                );
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Resolves a receiver expression to the value AST node assigned to it (typically
+ * a FunctionExpression for callable lookups). Mirrors the lookup branches of
+ * `resolveReceiverToClass` but returns the raw RHS instead of running it through
+ * `extractClassFromInitializer`. Used by Case E to dig into method bodies.
+ */
+function findReceiverValueNode(
+    ts: typeof tslib,
+    receiver: tslib.Expression,
+    getExtendIndex: GetExtendIndex,
+    getProtoIndex: GetProtoIndex,
+    getExpandoIndex?: GetExpandoIndex,
+    getIdentifierIndex?: GetIdentifierIndex
+): tslib.Expression | undefined {
+    // `this.<member>`
+    if (
+        ts.isPropertyAccessExpression(receiver) &&
+        receiver.expression.kind === ts.SyntaxKind.ThisKeyword
+    ) {
+        const memberName = receiver.name.text;
+        const literal = findEnclosingExtendLiteral(ts, receiver);
+        if (literal) {
+            const hit = lookupInLiteralAndChain(
+                ts, getExtendIndex, literal, memberName, getExpandoIndex
+            );
+            if (hit?.valueNode) return hit.valueNode;
+        }
+        const ownerClass = findPrototypeOwnerClass(ts, receiver);
+        if (ownerClass) {
+            const members = collectProtoMembers(getProtoIndex(), ownerClass, memberName);
+            if (members.length > 0) return members[0].initializer;
+        }
+        return undefined;
+    }
+
+    // `<sub>.<field>` (non-this chain)
+    if (ts.isPropertyAccessExpression(receiver)) {
+        const subClass = resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex, receiver.expression, getExpandoIndex, getIdentifierIndex
+        );
+        if (!subClass) return undefined;
+        const fieldName = receiver.name.text;
+
+        const entries = getExtendIndex().get(subClass);
+        if (entries) {
+            for (const entry of entries) {
+                const hit = lookupInLiteralAndChain(
+                    ts, getExtendIndex, entry.literal, fieldName, getExpandoIndex
+                );
+                if (hit?.valueNode) return hit.valueNode;
+            }
+        }
+        if (getExpandoIndex) {
+            const eHit = expandoHit(getExpandoIndex(), subClass, fieldName);
+            if (eHit?.valueNode) return eHit.valueNode;
+        }
+        const protoMember = lookupProtoMember(getProtoIndex(), subClass, fieldName);
+        if (protoMember) return protoMember.initializer;
+        return undefined;
+    }
+
+    // Bare identifier
+    if (ts.isIdentifier(receiver) && getIdentifierIndex) {
+        const entries = getIdentifierIndex().get(receiver.text);
+        if (entries && entries[0]) return entries[0].initializer;
     }
     return undefined;
 }
