@@ -24,8 +24,10 @@ This plugin sidesteps the whole type-inference problem by hooking the Language S
 
 ## Features
 
-- **Go to Definition**: `Cmd/Ctrl-click` on `this.xxx` jumps to `xxx:` in the same literal, and falls through to parent-class literals on cache miss (so `this.stopAllActions()` inside a `cc.Node.extend({...})` subclass jumps to `CCNode.js` where `cc.Node = cc.Class.extend({...})` defines it). Also resolves dotted-namespace static accesses like `sp.SkeletonAnimation.createWithJsonFile` or `ccui.Widget.TOUCH_ENDED` by indexing top-level `a.b.c = ...` assignments across the project.
-- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, also walking the parent chain. Dotted-namespace accesses get the same treatment.
+- **Go to Definition**: `Cmd/Ctrl-click` on `this.xxx` jumps to `xxx:` in the same literal, and falls through to parent-class literals on cache miss (so `this.stopAllActions()` inside a `cc.Node.extend({...})` subclass jumps to `CCNode.js` where `cc.Node = cc.Class.extend({...})` defines it). Also resolves:
+    - dotted-namespace static accesses like `sp.SkeletonAnimation.createWithJsonFile` or `ccui.Widget.TOUCH_ENDED`, by indexing top-level `a.b.c = ...` assignments. Object-literal RHS values are flattened too, so `cc.Node = { addChild: function(){...} }` style auto-binding stubs work.
+    - chained accesses like `this.m_layout.setBackGroundColor(...)` when `m_layout: ccui.Layout` (or `ccui.layout` with the project's lowercase type-hint convention) appears as a property in the extend literal. The receiver's class is inferred from the field's initializer and walked through its own extend chain.
+- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, using the same resolution paths as definition.
 - **Find All References**: from either a `xxx:` declaration or a `this.xxx` call site, lists all matching property declarations and `this.xxx` accesses inside `*.extend({...})` literals across the project
 
 All three augment tsserver's native answers only when those are empty/`any`-typed, so normal IntelliSense for non-cocos code is untouched.

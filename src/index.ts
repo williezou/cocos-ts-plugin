@@ -55,9 +55,10 @@ function init(modules: { typescript: typeof tslib }) {
                 if (original && original.definitions && original.definitions.length > 0) {
                     return original;
                 }
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
                 if (ctx) {
-                    log(`def: resolved this.${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
+                    log(`def: resolved ${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
                     return buildDefinition(ts, ctx);
                 }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
@@ -73,7 +74,8 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getDefinitionAtPosition", () => {
                 const original = ls.getDefinitionAtPosition(fileName, position);
                 if (original && original.length > 0) return original;
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
                 if (ctx) {
                     return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
                 }
@@ -88,9 +90,10 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getQuickInfoAtPosition", () => {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
                 if (original && !isAnyQuickInfo(ts, original)) return original;
-                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
                 if (ctx) {
-                    log(`hover: resolving this.${ctx.memberName}`);
+                    log(`hover: resolving ${ctx.memberName}`);
                     return buildQuickInfo(ts, ls, ctx) ?? original;
                 }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
@@ -207,6 +210,28 @@ function collectEntries(
                         initializer: node.right,
                         sourceFile: sf,
                     });
+                    // a.b = { foo: function(){...}, ... }  -> index each nested member as a.b.foo
+                    // (covers the cocos2d-x auto-api stub pattern in jsb_*_auto_api.js)
+                    if (ts.isObjectLiteralExpression(node.right)) {
+                        for (const prop of node.right.properties) {
+                            const propName = getPropertyName(ts, prop);
+                            const propNameNode = (prop as any).name as tslib.Node | undefined;
+                            if (!propName || !propNameNode) continue;
+                            const init = ts.isPropertyAssignment(prop)
+                                ? prop.initializer
+                                : ts.isMethodDeclaration(prop)
+                                ? (prop as unknown as tslib.Expression)
+                                : undefined;
+                            if (!init) continue;
+                            const nestedKey = `${lhsName}.${propName}`;
+                            addToIndex(expandoIndex, nestedKey, {
+                                fullName: nestedKey,
+                                nameNode: propNameNode,
+                                initializer: init,
+                                sourceFile: sf,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -280,24 +305,141 @@ function locateThisMember(
     if (parent.name !== node) return undefined;
     if (parent.expression.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
 
-    const memberName = node.text;
-
     const literal = findEnclosingExtendLiteral(ts, parent);
     if (!literal) return undefined;
 
-    // 1. Check the same literal first.
-    const directProp = findPropertyByName(ts, literal, memberName);
-    if (directProp) {
-        return makeContext(sourceFile, node, memberName, directProp, sourceFile);
-    }
+    const memberName = node.text;
+    const hit = lookupInLiteralAndChain(ts, getIndex, literal, memberName);
+    if (!hit) return undefined;
+    return makeContext(sourceFile, node, memberName, hit.property, hit.propertySourceFile);
+}
 
-    // 2. Walk the parent-class chain.
+/**
+ * Resolves `this.member.<sub>` and `<DottedClass>.<sub>` (where the receiver expression
+ * names a class in the extend index, possibly via a project type-hint convention like
+ * `m_layout: ccui.layout`). Walks the resolved class's extend chain to find `<sub>`.
+ */
+function locateChainedMember(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getIndex: () => ExtendIndex,
+    fileName: string,
+    position: number
+): ThisMemberContext | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    const parent = node.parent;
+    if (!parent || !ts.isPropertyAccessExpression(parent)) return undefined;
+    if (parent.name !== node) return undefined;
+
+    const receiver = parent.expression;
+    if (receiver.kind === ts.SyntaxKind.ThisKeyword) return undefined; // handled by locateThisMember
+
+    const className = resolveReceiverToClass(ts, getIndex, receiver);
+    if (!className) return undefined;
+
+    const memberName = node.text;
+    const entries = getIndex().get(className);
+    if (!entries || entries.length === 0) return undefined;
+    for (const entry of entries) {
+        const hit = lookupInLiteralAndChain(ts, getIndex, entry.literal, memberName);
+        if (hit) {
+            return makeContext(sourceFile, node, memberName, hit.property, hit.propertySourceFile);
+        }
+    }
+    return undefined;
+}
+
+function resolveReceiverToClass(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    receiver: tslib.Expression
+): string | undefined {
+    // Case A: `this.<member>` — read the type hint from `member`'s initializer in the
+    // enclosing extend literal (and its parent chain).
+    if (
+        ts.isPropertyAccessExpression(receiver) &&
+        receiver.expression.kind === ts.SyntaxKind.ThisKeyword
+    ) {
+        const literal = findEnclosingExtendLiteral(ts, receiver);
+        if (!literal) return undefined;
+        const hit = lookupInLiteralAndChain(ts, getIndex, literal, receiver.name.text);
+        if (!hit) return undefined;
+        const prop = hit.property;
+        const init = ts.isPropertyAssignment(prop) ? prop.initializer : undefined;
+        if (!init) return undefined;
+        const hintName = expressionToName(ts, init);
+        if (!hintName) return undefined;
+        return lookupClassName(getIndex(), hintName);
+    }
+    // Case B: receiver is a dotted name that matches a known class directly.
+    const direct = expressionToName(ts, receiver);
+    if (direct) {
+        const found = lookupClassName(getIndex(), direct);
+        if (found) return found;
+    }
+    return undefined;
+}
+
+/**
+ * Looks up a class name in the index, trying the exact name first, then a fallback
+ * with the last segment capitalized (handles project type-hint conventions like
+ * `m_layout: ccui.layout` where the convention writes the namespace lowercased but
+ * the real class definition is `ccui.Layout`).
+ */
+function lookupClassName(index: ExtendIndex, name: string): string | undefined {
+    if (index.has(name)) return name;
+    const dot = name.lastIndexOf(".");
+    if (dot < 0) {
+        const cap = name[0]?.toUpperCase() + name.slice(1);
+        return index.has(cap) ? cap : undefined;
+    }
+    const head = name.substring(0, dot + 1);
+    const tail = name.substring(dot + 1);
+    if (!tail) return undefined;
+    const cap = head + tail[0].toUpperCase() + tail.slice(1);
+    return index.has(cap) ? cap : undefined;
+}
+
+interface LiteralHit {
+    property: tslib.ObjectLiteralElementLike;
+    propertySourceFile: tslib.SourceFile;
+}
+
+/**
+ * Searches `literal` for a property named `memberName`. If not found, walks up the
+ * extend chain (via the literal's owner's parentName, looked up in the index).
+ */
+function lookupInLiteralAndChain(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    literal: tslib.ObjectLiteralExpression,
+    memberName: string
+): LiteralHit | undefined {
+    const direct = findPropertyByName(ts, literal, memberName);
+    if (direct) {
+        return { property: direct, propertySourceFile: literal.getSourceFile() };
+    }
     const owner = getLiteralOwner(ts, literal);
     if (!owner || !owner.parentName) return undefined;
+    return walkChain(ts, getIndex, owner.parentName, memberName);
+}
 
+function walkChain(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    startParent: string,
+    memberName: string
+): LiteralHit | undefined {
     const index = getIndex();
     const seen = new Set<string>();
-    let parentName: string | undefined = owner.parentName;
+    let parentName: string | undefined = startParent;
     while (parentName && !seen.has(parentName)) {
         seen.add(parentName);
         const entries = index.get(parentName);
@@ -305,7 +447,7 @@ function locateThisMember(
         for (const entry of entries) {
             const prop = findPropertyByName(ts, entry.literal, memberName);
             if (prop) {
-                return makeContext(sourceFile, node, memberName, prop, entry.sourceFile);
+                return { property: prop, propertySourceFile: entry.sourceFile };
             }
         }
         parentName = entries[0].parentName;
