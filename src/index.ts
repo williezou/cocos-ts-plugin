@@ -8,7 +8,16 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded");
+        log("plugin loaded v0.1.2");
+
+        const guard = <T>(name: string, fn: () => T, fallback: T): T => {
+            try {
+                return fn();
+            } catch (e: any) {
+                log(`error in ${name}: ${e && e.stack ? e.stack : e}`);
+                return fallback;
+            }
+        };
 
         const proxy: tslib.LanguageService = Object.create(null);
         for (const k of Object.keys(ls) as Array<keyof tslib.LanguageService>) {
@@ -16,48 +25,62 @@ function init(modules: { typescript: typeof tslib }) {
             proxy[k] = (...args: any[]) => fn.apply(ls, args);
         }
 
-        proxy.getDefinitionAndBoundSpan = (fileName, position) => {
-            const original = ls.getDefinitionAndBoundSpan(fileName, position);
-            if (original && original.definitions && original.definitions.length > 0) {
-                return original;
-            }
-            const ctx = locateThisMember(ts, ls, fileName, position);
-            if (!ctx) return original;
-            return buildDefinition(ts, ctx);
-        };
+        proxy.getDefinitionAndBoundSpan = (fileName, position) =>
+            guard("getDefinitionAndBoundSpan", () => {
+                const original = ls.getDefinitionAndBoundSpan(fileName, position);
+                if (original && original.definitions && original.definitions.length > 0) {
+                    return original;
+                }
+                const ctx = locateThisMember(ts, ls, fileName, position);
+                if (!ctx) {
+                    log(`def: no extend-this context at ${fileName}:${position}`);
+                    return original;
+                }
+                log(`def: resolved this.${ctx.memberName} -> offset ${ctx.propertyNameNode.getStart(ctx.sourceFile)}`);
+                return buildDefinition(ts, ctx);
+            }, ls.getDefinitionAndBoundSpan(fileName, position));
 
-        proxy.getDefinitionAtPosition = (fileName, position) => {
-            const original = ls.getDefinitionAtPosition(fileName, position);
-            if (original && original.length > 0) return original;
-            const ctx = locateThisMember(ts, ls, fileName, position);
-            if (!ctx) return undefined;
-            const built = buildDefinition(ts, ctx);
-            return built?.definitions as tslib.DefinitionInfo[] | undefined;
-        };
+        proxy.getDefinitionAtPosition = (fileName, position) =>
+            guard("getDefinitionAtPosition", () => {
+                const original = ls.getDefinitionAtPosition(fileName, position);
+                if (original && original.length > 0) return original;
+                const ctx = locateThisMember(ts, ls, fileName, position);
+                if (!ctx) return undefined;
+                const built = buildDefinition(ts, ctx);
+                return built?.definitions as tslib.DefinitionInfo[] | undefined;
+            }, ls.getDefinitionAtPosition(fileName, position));
 
-        proxy.getQuickInfoAtPosition = (fileName, position) => {
-            const original = ls.getQuickInfoAtPosition(fileName, position);
-            if (original && !isAnyQuickInfo(ts, original)) return original;
-            const ctx = locateThisMember(ts, ls, fileName, position);
-            if (!ctx) return original;
-            return buildQuickInfo(ts, ls, ctx) ?? original;
-        };
+        proxy.getQuickInfoAtPosition = (fileName, position) =>
+            guard("getQuickInfoAtPosition", () => {
+                const original = ls.getQuickInfoAtPosition(fileName, position);
+                if (original && !isAnyQuickInfo(ts, original)) return original;
+                const ctx = locateThisMember(ts, ls, fileName, position);
+                if (!ctx) return original;
+                log(`hover: resolving this.${ctx.memberName}`);
+                return buildQuickInfo(ts, ls, ctx) ?? original;
+            }, ls.getQuickInfoAtPosition(fileName, position));
 
-        proxy.findReferences = (fileName, position) => {
-            const original = ls.findReferences(fileName, position);
-            const memberCtx = resolveExtendMember(ts, ls, fileName, position);
-            if (!memberCtx) return original;
-            const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
-            return mergeReferences(ts, original, extra, memberCtx);
-        };
+        proxy.findReferences = (fileName, position) =>
+            guard("findReferences", () => {
+                const original = ls.findReferences(fileName, position);
+                const memberCtx = resolveExtendMember(ts, ls, fileName, position);
+                if (!memberCtx) {
+                    log(`refs: no extend-member context at ${fileName}:${position}`);
+                    return original;
+                }
+                const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+                log(`refs: ${memberCtx.memberName} -> tsserver=${original?.reduce((n, s) => n + s.references.length, 0) ?? 0}, scanned=${extra.length}`);
+                return mergeReferences(ts, original, extra, memberCtx);
+            }, ls.findReferences(fileName, position));
 
-        proxy.getReferencesAtPosition = (fileName, position) => {
-            const original = ls.getReferencesAtPosition(fileName, position) ?? [];
-            const memberCtx = resolveExtendMember(ts, ls, fileName, position);
-            if (!memberCtx) return original.length ? original : undefined;
-            const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
-            return dedupeReferences([...original, ...extra]);
-        };
+        proxy.getReferencesAtPosition = (fileName, position) =>
+            guard("getReferencesAtPosition", () => {
+                const original = ls.getReferencesAtPosition(fileName, position) ?? [];
+                const memberCtx = resolveExtendMember(ts, ls, fileName, position);
+                if (!memberCtx) return original.length ? original : undefined;
+                const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+                return dedupeReferences([...original, ...extra]);
+            }, ls.getReferencesAtPosition(fileName, position));
 
         return proxy;
     }
@@ -492,8 +515,10 @@ function findNodeAtPosition(
     sourceFile: tslib.SourceFile,
     position: number
 ): tslib.Node | undefined {
+    // Allow position == node.getEnd() so the cursor "just past" an identifier
+    // (e.g., right before a `:` or `(`) still resolves to that identifier.
     function visit(node: tslib.Node): tslib.Node | undefined {
-        if (position < node.getStart(sourceFile) || position >= node.getEnd()) {
+        if (position < node.getStart(sourceFile) || position > node.getEnd()) {
             return undefined;
         }
         const child = ts.forEachChild(node, visit);
