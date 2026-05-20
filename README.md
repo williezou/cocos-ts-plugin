@@ -26,12 +26,14 @@ This plugin sidesteps the whole type-inference problem by hooking the Language S
 
 - **Go to Definition**: `Cmd/Ctrl-click` on `this.xxx` jumps to `xxx:` in the same literal
 - **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc
+- **Find All References**: from either a `xxx:` declaration or a `this.xxx` call site, lists all matching property declarations and `this.xxx` accesses inside `*.extend({...})` literals across the project
 
-Both are added only when tsserver's native answer is missing or `any` — normal IntelliSense is untouched.
+All three augment tsserver's native answers only when those are empty/`any`-typed, so normal IntelliSense for non-cocos code is untouched.
 
-### Currently MVP-scoped
+### Current limitations
 
-Resolves `this.xxx` against **the same literal** only. Cross-file parent-class chains (`this.getPosition()` falling through to `cc.Node`'s definition in CCNode.js) are not yet supported.
+- **Same-literal resolution only for definition/hover.** Cross-file parent-class chains (`this.getPosition()` falling through to `cc.Node`'s definition in CCNode.js) are not yet supported.
+- **Find References is name-matched.** It returns all extend-literal members named `xxx` across the project, regardless of whether they belong to the same class hierarchy. False positives are possible if unrelated classes share a method name.
 
 ## Install
 
@@ -90,6 +92,7 @@ The plugin proxies three Language Service methods:
 | `getDefinitionAndBoundSpan` | If tsserver returns no definitions, parse the source, locate the enclosing `<X>.extend({...})` literal, and return the matching `xxx:` property as the definition. |
 | `getDefinitionAtPosition` | Same. |
 | `getQuickInfoAtPosition` | If tsserver returns `any` or nothing, build hover info from the property's value (function signature for `function(){}` initializers, inferred type otherwise) and emit its JSDoc. |
+| `findReferences` / `getReferencesAtPosition` | Scan every source file's `<X>.extend({...})` literals and collect (a) properties named `xxx`, (b) `this.xxx` accesses inside such literals. Merged with and deduplicated against tsserver's native results. |
 
 The proxy never intercepts when tsserver already has a real answer, so it composes safely with `@types` packages, `ThisType<T>` hints, and any other type augmentation you might add.
 
@@ -107,6 +110,7 @@ Output lands in `dist/`.
 ## Roadmap
 
 - [ ] Walk parent-class chain across files (`X = cc.Node.extend({...})` → resolve `this.getPosition` to `CCNode.js`)
+- [ ] Scope find-references to one class hierarchy (build the extend graph; today it's name-only)
 - [ ] Auto-completion provider (`this.<TAB>` lists literal members)
 - [ ] Handle `_super.xxx`
 - [ ] Optional configuration: which extend-style method names to detect (`extend`, `create`, …)

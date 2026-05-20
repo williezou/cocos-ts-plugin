@@ -43,6 +43,22 @@ function init(modules: { typescript: typeof tslib }) {
             return buildQuickInfo(ts, ls, ctx) ?? original;
         };
 
+        proxy.findReferences = (fileName, position) => {
+            const original = ls.findReferences(fileName, position);
+            const memberCtx = resolveExtendMember(ts, ls, fileName, position);
+            if (!memberCtx) return original;
+            const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+            return mergeReferences(ts, original, extra, memberCtx);
+        };
+
+        proxy.getReferencesAtPosition = (fileName, position) => {
+            const original = ls.getReferencesAtPosition(fileName, position) ?? [];
+            const memberCtx = resolveExtendMember(ts, ls, fileName, position);
+            if (!memberCtx) return original.length ? original : undefined;
+            const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+            return dedupeReferences([...original, ...extra]);
+        };
+
         return proxy;
     }
 
@@ -55,6 +71,13 @@ interface ThisMemberContext {
     memberName: string;
     property: tslib.ObjectLiteralElementLike;
     propertyNameNode: tslib.Node;
+}
+
+interface ExtendMemberContext {
+    sourceFile: tslib.SourceFile;
+    memberName: string;
+    /** The identifier node at the cursor (either `xxx` in `this.xxx` or `xxx:` in literal). */
+    identifier: tslib.Identifier;
 }
 
 function locateThisMember(
@@ -78,7 +101,82 @@ function locateThisMember(
 
     const memberName = node.text;
 
-    let cur: tslib.Node | undefined = parent.parent;
+    const literal = findEnclosingExtendLiteral(ts, parent);
+    if (!literal) return undefined;
+
+    const property = findPropertyByName(ts, literal, memberName);
+    if (!property) return undefined;
+    const propertyNameNode = (property as any).name ?? property;
+
+    return {
+        sourceFile,
+        identifier: node,
+        memberName,
+        property,
+        propertyNameNode,
+    };
+}
+
+/**
+ * Detect when the cursor is on a member name inside an extend literal — either:
+ *   1. `this.xxx` access expression's `xxx` identifier, or
+ *   2. `xxx:` property name in an extend literal
+ */
+function resolveExtendMember(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    fileName: string,
+    position: number
+): ExtendMemberContext | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    const parent = node.parent;
+    if (!parent) return undefined;
+
+    // Case 1: this.xxx
+    if (
+        ts.isPropertyAccessExpression(parent) &&
+        parent.name === node &&
+        parent.expression.kind === ts.SyntaxKind.ThisKeyword &&
+        findEnclosingExtendLiteral(ts, parent)
+    ) {
+        return { sourceFile, memberName: node.text, identifier: node };
+    }
+
+    // Case 2: property name in extend literal
+    if (
+        (ts.isPropertyAssignment(parent) ||
+            ts.isMethodDeclaration(parent) ||
+            ts.isShorthandPropertyAssignment(parent)) &&
+        (parent as any).name === node
+    ) {
+        const literalNode = parent.parent;
+        if (
+            literalNode &&
+            ts.isObjectLiteralExpression(literalNode) &&
+            literalNode.parent &&
+            ts.isCallExpression(literalNode.parent) &&
+            literalNode.parent.arguments[0] === literalNode &&
+            isExtendCall(ts, literalNode.parent)
+        ) {
+            return { sourceFile, memberName: node.text, identifier: node };
+        }
+    }
+
+    return undefined;
+}
+
+function findEnclosingExtendLiteral(
+    ts: typeof tslib,
+    start: tslib.Node
+): tslib.ObjectLiteralExpression | undefined {
+    let cur: tslib.Node | undefined = start.parent;
     while (cur) {
         if (
             ts.isObjectLiteralExpression(cur) &&
@@ -87,16 +185,7 @@ function locateThisMember(
             cur.parent.arguments[0] === cur &&
             isExtendCall(ts, cur.parent)
         ) {
-            const property = findPropertyByName(ts, cur, memberName);
-            if (!property) return undefined;
-            const propertyNameNode = (property as any).name ?? property;
-            return {
-                sourceFile,
-                identifier: node,
-                memberName,
-                property,
-                propertyNameNode,
-            };
+            return cur;
         }
         cur = cur.parent;
     }
@@ -188,6 +277,160 @@ function buildQuickInfo(
         documentation: extractJSDocAsParts(ts, property),
         tags: [],
     };
+}
+
+function scanExtendReferences(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    memberName: string
+): tslib.ReferenceEntry[] {
+    const program = ls.getProgram();
+    if (!program) return [];
+
+    const refs: tslib.ReferenceEntry[] = [];
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        walkExtendLiterals(ts, sf, (literal) => {
+            // 1. Property declarations matching the name.
+            for (const prop of literal.properties) {
+                if (getPropertyName(ts, prop) !== memberName) continue;
+                const nameNode = (prop as any).name as tslib.Node | undefined;
+                if (!nameNode) continue;
+                const start = nameNode.getStart(sf);
+                refs.push({
+                    fileName: sf.fileName,
+                    textSpan: { start, length: nameNode.getEnd() - start },
+                    isWriteAccess: true,
+                });
+            }
+            // 2. this.xxx accesses inside the literal.
+            walkThisAccesses(ts, literal, memberName, (id) => {
+                const start = id.getStart(sf);
+                refs.push({
+                    fileName: sf.fileName,
+                    textSpan: { start, length: id.getEnd() - start },
+                    isWriteAccess: isWriteAccessOfPropertyAccess(ts, id),
+                });
+            });
+        });
+    }
+    return refs;
+}
+
+function isWriteAccessOfPropertyAccess(ts: typeof tslib, id: tslib.Identifier): boolean {
+    // id is the .name of a PropertyAccessExpression; check if it's the LHS of an assignment.
+    const access = id.parent;
+    if (!access) return false;
+    const assign = access.parent;
+    if (!assign) return false;
+    if (ts.isBinaryExpression(assign) && assign.left === access) {
+        const op = assign.operatorToken.kind;
+        return (
+            op === ts.SyntaxKind.EqualsToken ||
+            op === ts.SyntaxKind.PlusEqualsToken ||
+            op === ts.SyntaxKind.MinusEqualsToken ||
+            op === ts.SyntaxKind.AsteriskEqualsToken ||
+            op === ts.SyntaxKind.SlashEqualsToken
+        );
+    }
+    return false;
+}
+
+function walkExtendLiterals(
+    ts: typeof tslib,
+    sourceFile: tslib.SourceFile,
+    callback: (literal: tslib.ObjectLiteralExpression) => void
+): void {
+    function visit(node: tslib.Node): void {
+        if (
+            ts.isCallExpression(node) &&
+            isExtendCall(ts, node) &&
+            node.arguments.length > 0 &&
+            ts.isObjectLiteralExpression(node.arguments[0])
+        ) {
+            callback(node.arguments[0] as tslib.ObjectLiteralExpression);
+        }
+        ts.forEachChild(node, visit);
+    }
+    visit(sourceFile);
+}
+
+function walkThisAccesses(
+    ts: typeof tslib,
+    root: tslib.Node,
+    name: string,
+    callback: (id: tslib.Identifier) => void
+): void {
+    function visit(node: tslib.Node): void {
+        if (
+            ts.isPropertyAccessExpression(node) &&
+            node.expression.kind === ts.SyntaxKind.ThisKeyword &&
+            ts.isIdentifier(node.name) &&
+            node.name.text === name
+        ) {
+            callback(node.name);
+        }
+        ts.forEachChild(node, visit);
+    }
+    visit(root);
+}
+
+function mergeReferences(
+    ts: typeof tslib,
+    original: tslib.ReferencedSymbol[] | undefined,
+    extra: tslib.ReferenceEntry[],
+    ctx: ExtendMemberContext
+): tslib.ReferencedSymbol[] | undefined {
+    const seen = new Set<string>();
+    const collected: tslib.ReferenceEntry[] = [];
+
+    if (original) {
+        for (const sym of original) {
+            for (const ref of sym.references) {
+                const key = `${ref.fileName}:${ref.textSpan.start}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                collected.push(ref);
+            }
+        }
+    }
+    for (const ref of extra) {
+        const key = `${ref.fileName}:${ref.textSpan.start}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        collected.push(ref);
+    }
+
+    if (collected.length === 0) return original;
+
+    const definition: tslib.ReferencedSymbolDefinitionInfo = original && original[0]
+        ? original[0].definition
+        : {
+              containerKind: "" as tslib.ScriptElementKind,
+              containerName: "",
+              fileName: ctx.sourceFile.fileName,
+              kind: ts.ScriptElementKind.memberVariableElement,
+              name: ctx.memberName,
+              textSpan: {
+                  start: ctx.identifier.getStart(ctx.sourceFile),
+                  length: ctx.identifier.getEnd() - ctx.identifier.getStart(ctx.sourceFile),
+              },
+              displayParts: [{ text: ctx.memberName, kind: "propertyName" }],
+          };
+
+    return [{ definition, references: collected }];
+}
+
+function dedupeReferences(refs: tslib.ReferenceEntry[]): tslib.ReferenceEntry[] {
+    const seen = new Set<string>();
+    const out: tslib.ReferenceEntry[] = [];
+    for (const r of refs) {
+        const key = `${r.fileName}:${r.textSpan.start}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(r);
+    }
+    return out;
 }
 
 function extractJSDocAsParts(
