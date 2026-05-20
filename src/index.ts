@@ -8,20 +8,31 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.2.0");
+        log("plugin loaded v0.3.0");
 
-        let cachedIndex: { program: tslib.Program; index: ExtendIndex } | undefined;
+        let cachedIndex: { program: tslib.Program; extend: ExtendIndex; expando: ExpandoIndex } | undefined;
 
-        const getIndex = (): ExtendIndex => {
-            const program = ls.getProgram();
-            if (!program) return new Map();
-            if (cachedIndex && cachedIndex.program === program) return cachedIndex.index;
-            const started = Date.now();
-            const index = buildExtendIndex(ts, program);
-            log(`built extend index: ${index.size} classes, ${Date.now() - started}ms`);
-            cachedIndex = { program, index };
-            return index;
+        const getExtendIndexNow = (): ExtendIndex => {
+            ensureIndex();
+            return cachedIndex!.extend;
         };
+        const getExpandoIndex = (): ExpandoIndex => {
+            ensureIndex();
+            return cachedIndex!.expando;
+        };
+
+        function ensureIndex(): void {
+            const program = ls.getProgram();
+            if (!program) {
+                cachedIndex = { program: program!, extend: new Map(), expando: new Map() };
+                return;
+            }
+            if (cachedIndex && cachedIndex.program === program) return;
+            const started = Date.now();
+            const { extend, expando } = buildIndices(ts, program);
+            log(`indices built: ${extend.size} extend classes, ${expando.size} expando paths, ${Date.now() - started}ms`);
+            cachedIndex = { program, extend, expando };
+        }
 
         const guard = <T>(name: string, fn: () => T, fallback: T): T => {
             try {
@@ -44,33 +55,50 @@ function init(modules: { typescript: typeof tslib }) {
                 if (original && original.definitions && original.definitions.length > 0) {
                     return original;
                 }
-                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
-                if (!ctx) {
-                    log(`def: no extend-this context at ${fileName}:${position}`);
-                    return original;
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                if (ctx) {
+                    log(`def: resolved this.${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
+                    return buildDefinition(ts, ctx);
                 }
-                log(`def: resolved this.${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
-                return buildDefinition(ts, ctx);
+                const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
+                if (dotted) {
+                    log(`def: resolved ${dotted.fullName} -> ${dotted.entry.sourceFile.fileName}:${dotted.entry.nameNode.getStart(dotted.entry.sourceFile)}`);
+                    return buildDefinitionFromExpando(ts, dotted);
+                }
+                log(`def: no context at ${fileName}:${position}`);
+                return original;
             }, ls.getDefinitionAndBoundSpan(fileName, position));
 
         proxy.getDefinitionAtPosition = (fileName, position) =>
             guard("getDefinitionAtPosition", () => {
                 const original = ls.getDefinitionAtPosition(fileName, position);
                 if (original && original.length > 0) return original;
-                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
-                if (!ctx) return undefined;
-                const built = buildDefinition(ts, ctx);
-                return built?.definitions as tslib.DefinitionInfo[] | undefined;
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                if (ctx) {
+                    return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
+                }
+                const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
+                if (dotted) {
+                    return buildDefinitionFromExpando(ts, dotted).definitions as tslib.DefinitionInfo[];
+                }
+                return undefined;
             }, ls.getDefinitionAtPosition(fileName, position));
 
         proxy.getQuickInfoAtPosition = (fileName, position) =>
             guard("getQuickInfoAtPosition", () => {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
                 if (original && !isAnyQuickInfo(ts, original)) return original;
-                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
-                if (!ctx) return original;
-                log(`hover: resolving this.${ctx.memberName}`);
-                return buildQuickInfo(ts, ls, ctx) ?? original;
+                const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position);
+                if (ctx) {
+                    log(`hover: resolving this.${ctx.memberName}`);
+                    return buildQuickInfo(ts, ls, ctx) ?? original;
+                }
+                const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
+                if (dotted) {
+                    log(`hover: resolving ${dotted.fullName}`);
+                    return buildQuickInfoFromExpando(ts, ls, dotted) ?? original;
+                }
+                return original;
             }, ls.getQuickInfoAtPosition(fileName, position));
 
         proxy.findReferences = (fileName, position) =>
@@ -126,36 +154,60 @@ interface ExtendEntry {
 
 type ExtendIndex = Map<string, ExtendEntry[]>;
 
-function buildExtendIndex(ts: typeof tslib, program: tslib.Program): ExtendIndex {
-    const index: ExtendIndex = new Map();
-    for (const sf of program.getSourceFiles()) {
-        if (sf.isDeclarationFile) continue;
-        collectExtendEntries(ts, sf, index);
-    }
-    return index;
+interface ExpandoEntry {
+    fullName: string;                 // e.g., "ccui.Widget.TOUCH_ENDED"
+    nameNode: tslib.Node;             // the `.name` part of the LHS PropertyAccess
+    initializer: tslib.Expression;    // the RHS expression
+    sourceFile: tslib.SourceFile;
 }
 
-function collectExtendEntries(
+type ExpandoIndex = Map<string, ExpandoEntry[]>;
+
+function buildIndices(
+    ts: typeof tslib,
+    program: tslib.Program
+): { extend: ExtendIndex; expando: ExpandoIndex } {
+    const extend: ExtendIndex = new Map();
+    const expando: ExpandoIndex = new Map();
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        collectEntries(ts, sf, extend, expando);
+    }
+    return { extend, expando };
+}
+
+function collectEntries(
     ts: typeof tslib,
     sf: tslib.SourceFile,
-    index: ExtendIndex
+    extendIndex: ExtendIndex,
+    expandoIndex: ExpandoIndex
 ): void {
     function visit(node: tslib.Node): void {
         // let/var/const <name> = <expr>.extend({...})
         if (ts.isVariableDeclaration(node) && node.initializer && isExtendCallWithLiteral(ts, node.initializer)) {
             if (ts.isIdentifier(node.name)) {
-                addExtendEntry(index, node.name.text, makeEntry(ts, node.name.text, node.initializer, sf));
+                addToIndex(extendIndex, node.name.text, makeEntry(ts, node.name.text, node.initializer, sf));
             }
         }
-        // <LHS> = <expr>.extend({...})  (assignment expression)
+        // <LHS> = <RHS>
         if (
             ts.isBinaryExpression(node) &&
-            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-            isExtendCallWithLiteral(ts, node.right)
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         ) {
-            const className = expressionToName(ts, node.left);
-            if (className) {
-                addExtendEntry(index, className, makeEntry(ts, className, node.right, sf));
+            const lhsName = expressionToName(ts, node.left);
+            if (lhsName) {
+                if (isExtendCallWithLiteral(ts, node.right)) {
+                    // X = Y.extend({...})  -> extend entry
+                    addToIndex(extendIndex, lhsName, makeEntry(ts, lhsName, node.right, sf));
+                } else if (ts.isPropertyAccessExpression(node.left) && lhsName.includes(".")) {
+                    // a.b.c = anything  -> expando entry (only when LHS is a dotted property access)
+                    addToIndex(expandoIndex, lhsName, {
+                        fullName: lhsName,
+                        nameNode: node.left.name,
+                        initializer: node.right,
+                        sourceFile: sf,
+                    });
+                }
             }
         }
         ts.forEachChild(node, visit);
@@ -190,7 +242,7 @@ function makeEntry(
     };
 }
 
-function addExtendEntry(index: ExtendIndex, key: string, entry: ExtendEntry): void {
+function addToIndex<T>(index: Map<string, T[]>, key: string, entry: T): void {
     let arr = index.get(key);
     if (!arr) {
         arr = [];
@@ -381,6 +433,110 @@ function findEnclosingExtendLiteral(
         cur = cur.parent;
     }
     return undefined;
+}
+
+interface DottedAccessHit {
+    sourceFile: tslib.SourceFile;
+    identifier: tslib.Identifier;
+    fullName: string;
+    entry: ExpandoEntry;
+}
+
+function locateDottedAccess(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getIndex: () => ExpandoIndex,
+    fileName: string,
+    position: number
+): DottedAccessHit | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    const parent = node.parent;
+    if (!parent || !ts.isPropertyAccessExpression(parent)) return undefined;
+    if (parent.name !== node) return undefined;
+    // Exclude `this.xxx` — handled elsewhere.
+    if (parent.expression.kind === ts.SyntaxKind.ThisKeyword) return undefined;
+
+    const fullName = expressionToName(ts, parent);
+    if (!fullName || !fullName.includes(".")) return undefined;
+
+    const entries = getIndex().get(fullName);
+    if (!entries || entries.length === 0) return undefined;
+
+    return { sourceFile, identifier: node, fullName, entry: entries[0] };
+}
+
+function buildDefinitionFromExpando(
+    ts: typeof tslib,
+    hit: DottedAccessHit
+): tslib.DefinitionInfoAndBoundSpan {
+    const { sourceFile, identifier, fullName, entry } = hit;
+    const sourceStart = identifier.getStart(sourceFile);
+    const sourceLength = identifier.getEnd() - sourceStart;
+    const destStart = entry.nameNode.getStart(entry.sourceFile);
+    const destLength = entry.nameNode.getEnd() - destStart;
+    return {
+        textSpan: { start: sourceStart, length: sourceLength },
+        definitions: [
+            {
+                fileName: entry.sourceFile.fileName,
+                textSpan: { start: destStart, length: destLength },
+                kind: ts.ScriptElementKind.memberVariableElement,
+                name: identifier.text,
+                containerName: fullName.substring(0, fullName.lastIndexOf(".")),
+                containerKind: ts.ScriptElementKind.classElement,
+            } as tslib.DefinitionInfo,
+        ],
+    };
+}
+
+function buildQuickInfoFromExpando(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    hit: DottedAccessHit
+): tslib.QuickInfo | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const checker = program.getTypeChecker();
+
+    const { sourceFile, identifier, fullName, entry } = hit;
+    const sourceStart = identifier.getStart(sourceFile);
+    const sourceLength = identifier.getEnd() - sourceStart;
+
+    let label = "(property) ";
+    let typeStr: string;
+    let kind: tslib.ScriptElementKind = ts.ScriptElementKind.memberVariableElement;
+
+    const init = entry.initializer;
+    if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) {
+        const sig = checker.getSignatureFromDeclaration(init);
+        typeStr = sig ? checker.signatureToString(sig) : "(...args: any[]) => any";
+        kind = ts.ScriptElementKind.memberFunctionElement;
+        label = "(method) ";
+    } else {
+        const t = checker.getTypeAtLocation(init);
+        typeStr = checker.typeToString(t);
+    }
+
+    return {
+        kind,
+        kindModifiers: "",
+        textSpan: { start: sourceStart, length: sourceLength },
+        displayParts: [
+            { text: label, kind: "punctuation" },
+            { text: fullName, kind: "propertyName" },
+            { text: ": ", kind: "punctuation" },
+            { text: typeStr, kind: "text" },
+        ],
+        documentation: [],
+        tags: [],
+    };
 }
 
 function buildDefinition(

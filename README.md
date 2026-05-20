@@ -24,8 +24,8 @@ This plugin sidesteps the whole type-inference problem by hooking the Language S
 
 ## Features
 
-- **Go to Definition**: `Cmd/Ctrl-click` on `this.xxx` jumps to `xxx:` in the same literal, and falls through to parent-class literals on cache miss (so `this.stopAllActions()` inside a `cc.Node.extend({...})` subclass jumps to `CCNode.js` where `cc.Node = cc.Class.extend({...})` defines it)
-- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, also walking the parent chain
+- **Go to Definition**: `Cmd/Ctrl-click` on `this.xxx` jumps to `xxx:` in the same literal, and falls through to parent-class literals on cache miss (so `this.stopAllActions()` inside a `cc.Node.extend({...})` subclass jumps to `CCNode.js` where `cc.Node = cc.Class.extend({...})` defines it). Also resolves dotted-namespace static accesses like `sp.SkeletonAnimation.createWithJsonFile` or `ccui.Widget.TOUCH_ENDED` by indexing top-level `a.b.c = ...` assignments across the project.
+- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, also walking the parent chain. Dotted-namespace accesses get the same treatment.
 - **Find All References**: from either a `xxx:` declaration or a `this.xxx` call site, lists all matching property declarations and `this.xxx` accesses inside `*.extend({...})` literals across the project
 
 All three augment tsserver's native answers only when those are empty/`any`-typed, so normal IntelliSense for non-cocos code is untouched.
@@ -88,9 +88,9 @@ The plugin proxies three Language Service methods:
 
 | Method | Behavior |
 |---|---|
-| `getDefinitionAndBoundSpan` | If tsserver returns no definitions, parse the source, locate the enclosing `<X>.extend({...})` literal, and return the matching `xxx:` property as the definition. If not found in the same literal, walk a cached `ClassName → { parentName, literal, file }` index up the extend chain. |
+| `getDefinitionAndBoundSpan` | If tsserver returns no definitions, parse the source, locate the enclosing `<X>.extend({...})` literal, and return the matching `xxx:` property as the definition. Walks the cached extend index up the parent chain on miss. Falls back to a cached expando index (`a.b.c = …` assignments) for dotted-namespace lookups. |
 | `getDefinitionAtPosition` | Same. |
-| `getQuickInfoAtPosition` | If tsserver returns `any` or nothing, build hover info from the property's value (function signature for `function(){}` initializers, inferred type otherwise) and emit its JSDoc. Walks the parent chain in the same way. |
+| `getQuickInfoAtPosition` | If tsserver returns `any` or nothing, build hover info from the property's value (function signature for `function(){}` initializers, inferred type otherwise) and emit its JSDoc. Walks the parent chain and expando index in the same way. |
 | `findReferences` / `getReferencesAtPosition` | Scan every source file's `<X>.extend({...})` literals and collect (a) properties named `xxx`, (b) `this.xxx` accesses inside such literals. Merged with and deduplicated against tsserver's native results. |
 
 The proxy never intercepts when tsserver already has a real answer, so it composes safely with `@types` packages, `ThisType<T>` hints, and any other type augmentation you might add.
