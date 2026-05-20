@@ -11,6 +11,7 @@ import type {
     ExtendEntry,
     ExtendIndex,
     ExpandoIndex,
+    IdentifierIndex,
     PrototypeIndex,
     PrototypeMember,
 } from "./types";
@@ -28,19 +29,25 @@ import type {
 export function buildIndices(
     ts: typeof tslib,
     program: tslib.Program
-): { extend: ExtendIndex; expando: ExpandoIndex; proto: PrototypeIndex } {
+): {
+    extend: ExtendIndex;
+    expando: ExpandoIndex;
+    proto: PrototypeIndex;
+    identifier: IdentifierIndex;
+} {
     const extend: ExtendIndex = new Map();
     const expando: ExpandoIndex = new Map();
     const proto: PrototypeIndex = new Map();
+    const identifier: IdentifierIndex = new Map();
     for (const sf of program.getSourceFiles()) {
         if (sf.isDeclarationFile) continue;
-        collectEntries(ts, sf, extend, expando, proto);
+        collectEntries(ts, sf, extend, expando, proto, identifier);
     }
     for (const sf of program.getSourceFiles()) {
         if (sf.isDeclarationFile) continue;
         collectAugmentedFields(ts, sf, extend, expando, proto);
     }
-    return { extend, expando, proto };
+    return { extend, expando, proto, identifier };
 }
 
 function collectEntries(
@@ -48,7 +55,8 @@ function collectEntries(
     sf: tslib.SourceFile,
     extendIndex: ExtendIndex,
     expandoIndex: ExpandoIndex,
-    protoIndex: PrototypeIndex
+    protoIndex: PrototypeIndex,
+    identifierIndex: IdentifierIndex
 ): void {
     function visit(node: tslib.Node): void {
         // let/var/const <name> = <expr>.extend({...})
@@ -64,6 +72,22 @@ function collectEntries(
                     makeExtendEntry(ts, node.name.text, node.initializer, sf)
                 );
             }
+        }
+        // let/var/const <name> = <init>  -> identifier entry (for bare-identifier
+        // receivers like `shBeachMgr.foo()`). We always record, even when the
+        // initializer is also captured elsewhere — resolveReceiverToClass will
+        // try interpretations in order.
+        if (
+            ts.isVariableDeclaration(node) &&
+            node.initializer &&
+            ts.isIdentifier(node.name)
+        ) {
+            addToIndex(identifierIndex, node.name.text, {
+                name: node.name.text,
+                nameNode: node.name,
+                initializer: node.initializer,
+                sourceFile: sf,
+            });
         }
         // `this.X = <value>` inside a constructor-bound function -> proto member
         if (

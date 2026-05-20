@@ -16,6 +16,7 @@ import type {
     ExtendMemberContext,
     GetExpandoIndex,
     GetExtendIndex,
+    GetIdentifierIndex,
     GetProtoIndex,
     LiteralHit,
     PrototypeIndex,
@@ -122,6 +123,7 @@ export function locateChainedMember(
     getIndex: GetExtendIndex,
     getProtoIndex: GetProtoIndex,
     getExpandoIndex: GetExpandoIndex,
+    getIdentifierIndex: GetIdentifierIndex,
     fileName: string,
     position: number
 ): ThisMemberContext | undefined {
@@ -141,7 +143,7 @@ export function locateChainedMember(
     if (receiver.kind === ts.SyntaxKind.ThisKeyword) return undefined; // handled by locateThisMember
 
     const className = resolveReceiverToClass(
-        ts, getIndex, getProtoIndex, receiver, getExpandoIndex
+        ts, getIndex, getProtoIndex, receiver, getExpandoIndex, getIdentifierIndex
     );
     if (!className) return undefined;
 
@@ -155,9 +157,19 @@ export function locateChainedMember(
             if (hit) return makeContext(sourceFile, node, memberName, hit);
         }
     }
-    // Fallback: maybe the member lives directly as an expando on `className` itself.
+    // Fallback A: member lives directly as an expando on `className`.
     const onClass = expandoHit(getExpandoIndex(), className, memberName);
     if (onClass) return makeContext(sourceFile, node, memberName, onClass);
+    // Fallback B: `className` is a prototype/constructor class (no extend literal),
+    // walk its prototype chain.
+    const protoMember = lookupProtoMember(getProtoIndex(), className, memberName);
+    if (protoMember) {
+        return makeContext(sourceFile, node, memberName, {
+            nameNode: protoMember.nameNode,
+            valueNode: protoMember.initializer,
+            propertySourceFile: protoMember.sourceFile,
+        });
+    }
     return undefined;
 }
 
@@ -262,7 +274,8 @@ export function resolveReceiverToClass(
     getExtendIndex: GetExtendIndex,
     getProtoIndex: GetProtoIndex,
     receiver: tslib.Expression,
-    getExpandoIndex?: GetExpandoIndex
+    getExpandoIndex?: GetExpandoIndex,
+    getIdentifierIndex?: GetIdentifierIndex
 ): string | undefined {
     // Case A: `this.<member>`
     if (
@@ -278,7 +291,7 @@ export function resolveReceiverToClass(
                 ts, getExtendIndex, literal, memberName, getExpandoIndex
             );
             if (hit?.valueNode) {
-                const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex);
+                const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex);
                 if (cls) return cls;
             }
         }
@@ -288,7 +301,7 @@ export function resolveReceiverToClass(
         if (ownerClass) {
             const members = collectProtoMembers(getProtoIndex(), ownerClass, memberName);
             for (const m of members) {
-                const cls = extractClassFromInitializer(ts, m.initializer, getExtendIndex);
+                const cls = extractClassFromInitializer(ts, m.initializer, getExtendIndex, getProtoIndex);
                 if (cls) return cls;
             }
         }
@@ -298,16 +311,15 @@ export function resolveReceiverToClass(
     // Case B: dotted name that matches a known class directly
     const direct = expressionToName(ts, receiver);
     if (direct) {
-        const found = lookupClassName(getExtendIndex(), direct);
+        const found = lookupClassName(getExtendIndex(), direct, getProtoIndex());
         if (found) return found;
     }
 
     // Case C: multi-level chain — `<sub>.<field>` where <sub> isn't `this`.
-    // Recursively resolve <sub> to a class, then look up <field>'s type hint
-    // in that class's chain (including augmented expando entries from pass 2).
     if (ts.isPropertyAccessExpression(receiver)) {
         const subClass = resolveReceiverToClass(
-            ts, getExtendIndex, getProtoIndex, receiver.expression, getExpandoIndex
+            ts, getExtendIndex, getProtoIndex, receiver.expression,
+            getExpandoIndex, getIdentifierIndex
         );
         if (!subClass) return undefined;
         const fieldName = receiver.name.text;
@@ -319,7 +331,7 @@ export function resolveReceiverToClass(
                     ts, getExtendIndex, entry.literal, fieldName, getExpandoIndex
                 );
                 if (hit?.valueNode) {
-                    const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex);
+                    const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex);
                     if (cls) return cls;
                 }
             }
@@ -327,7 +339,20 @@ export function resolveReceiverToClass(
         if (getExpandoIndex) {
             const eHit = expandoHit(getExpandoIndex(), subClass, fieldName);
             if (eHit?.valueNode) {
-                const cls = extractClassFromInitializer(ts, eHit.valueNode, getExtendIndex);
+                const cls = extractClassFromInitializer(ts, eHit.valueNode, getExtendIndex, getProtoIndex);
+                if (cls) return cls;
+            }
+        }
+        return undefined;
+    }
+
+    // Case D: bare identifier — resolve via the top-level identifier index
+    // (`let shBeachMgr = new ShanghaiBeachManager()` etc).
+    if (ts.isIdentifier(receiver) && getIdentifierIndex) {
+        const entries = getIdentifierIndex().get(receiver.text);
+        if (entries) {
+            for (const entry of entries) {
+                const cls = extractClassFromInitializer(ts, entry.initializer, getExtendIndex, getProtoIndex);
                 if (cls) return cls;
             }
         }
@@ -345,28 +370,52 @@ export function resolveReceiverToClass(
 export function extractClassFromInitializer(
     ts: typeof tslib,
     init: tslib.Expression | undefined,
-    getExtendIndex: GetExtendIndex
+    getExtendIndex: GetExtendIndex,
+    getProtoIndex?: GetProtoIndex
 ): string | undefined {
     if (!init) return undefined;
     if (init.kind === ts.SyntaxKind.NullKeyword) return undefined;
     if (init.kind === ts.SyntaxKind.UndefinedKeyword) return undefined;
 
+    // Unwrap `(expr)` and short-circuit guards like `x || new Foo()`, `x ?? new Foo()`.
+    if (ts.isParenthesizedExpression(init)) {
+        return extractClassFromInitializer(ts, init.expression, getExtendIndex, getProtoIndex);
+    }
+    if (ts.isBinaryExpression(init)) {
+        const op = init.operatorToken.kind;
+        if (
+            op === ts.SyntaxKind.BarBarToken ||
+            op === ts.SyntaxKind.QuestionQuestionToken
+        ) {
+            return (
+                extractClassFromInitializer(ts, init.right, getExtendIndex, getProtoIndex) ??
+                extractClassFromInitializer(ts, init.left, getExtendIndex, getProtoIndex)
+            );
+        }
+    }
+    if (ts.isConditionalExpression(init)) {
+        return (
+            extractClassFromInitializer(ts, init.whenTrue, getExtendIndex, getProtoIndex) ??
+            extractClassFromInitializer(ts, init.whenFalse, getExtendIndex, getProtoIndex)
+        );
+    }
+
     const direct = expressionToName(ts, init);
     if (direct) {
-        const found = lookupClassName(getExtendIndex(), direct);
+        const found = lookupClassName(getExtendIndex(), direct, getProtoIndex?.());
         if (found) return found;
     }
     if (ts.isNewExpression(init)) {
         const ctorName = expressionToName(ts, init.expression);
         if (ctorName) {
-            const found = lookupClassName(getExtendIndex(), ctorName);
+            const found = lookupClassName(getExtendIndex(), ctorName, getProtoIndex?.());
             if (found) return found;
         }
     }
     if (ts.isCallExpression(init) && ts.isPropertyAccessExpression(init.expression)) {
         const receiverName = expressionToName(ts, init.expression.expression);
         if (receiverName) {
-            const found = lookupClassName(getExtendIndex(), receiverName);
+            const found = lookupClassName(getExtendIndex(), receiverName, getProtoIndex?.());
             if (found) return found;
         }
     }
@@ -381,18 +430,23 @@ export function extractClassFromInitializer(
  * conventions like `m_layout: ccui.layout` where the namespace is lowercased
  * but the real class is `ccui.Layout`.
  */
-export function lookupClassName(index: ExtendIndex, name: string): string | undefined {
-    if (index.has(name)) return name;
+export function lookupClassName(
+    index: ExtendIndex,
+    name: string,
+    protoIndex?: PrototypeIndex
+): string | undefined {
+    const exists = (n: string): boolean => index.has(n) || (protoIndex?.has(n) ?? false);
+    if (exists(name)) return name;
     const dot = name.lastIndexOf(".");
     if (dot < 0) {
         const cap = name[0]?.toUpperCase() + name.slice(1);
-        return index.has(cap) ? cap : undefined;
+        return exists(cap) ? cap : undefined;
     }
     const head = name.substring(0, dot + 1);
     const tail = name.substring(dot + 1);
     if (!tail) return undefined;
     const cap = head + tail[0].toUpperCase() + tail.slice(1);
-    return index.has(cap) ? cap : undefined;
+    return exists(cap) ? cap : undefined;
 }
 
 /**

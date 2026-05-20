@@ -73,8 +73,18 @@ export interface PrototypeIndexEntry {
 
 export type PrototypeIndex = Map<string, PrototypeIndexEntry>;
 
+export interface IdentifierEntry {
+    name: string;                       // e.g., "shBeachMgr"
+    nameNode: tslib.Node;
+    initializer: tslib.Expression;      // RHS of the declaration
+    sourceFile: tslib.SourceFile;
+}
+
+export type IdentifierIndex = Map<string, IdentifierEntry[]>;
+
 // ─── Convenience getter aliases used throughout the resolver/providers ──────
 
 export type GetExtendIndex = () => ExtendIndex;
 export type GetExpandoIndex = () => ExpandoIndex;
 export type GetProtoIndex = () => PrototypeIndex;
+export type GetIdentifierIndex = () => IdentifierIndex;

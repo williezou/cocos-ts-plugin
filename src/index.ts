@@ -18,7 +18,12 @@ import {
     mergeReferences,
     scanExtendReferences,
 } from "./providers";
-import type { ExpandoIndex, ExtendIndex, PrototypeIndex } from "./types";
+import type {
+    ExpandoIndex,
+    ExtendIndex,
+    IdentifierIndex,
+    PrototypeIndex,
+} from "./types";
 
 /**
  * TypeScript Language Service plugin for cocos2d-x / cocos2d-html5 JS code.
@@ -45,6 +50,7 @@ function init(modules: { typescript: typeof tslib }) {
             extend: ExtendIndex;
             expando: ExpandoIndex;
             proto: PrototypeIndex;
+            identifier: IdentifierIndex;
         } | undefined;
 
         function ensureIndex(): void {
@@ -55,16 +61,17 @@ function init(modules: { typescript: typeof tslib }) {
                     extend: new Map(),
                     expando: new Map(),
                     proto: new Map(),
+                    identifier: new Map(),
                 };
                 return;
             }
             if (cachedIndex && cachedIndex.program === program) return;
             const started = Date.now();
-            const { extend, expando, proto } = buildIndices(ts, program);
+            const { extend, expando, proto, identifier } = buildIndices(ts, program);
             log(
-                `indices built: ${extend.size} extend, ${expando.size} expando, ${proto.size} proto, ${Date.now() - started}ms`
+                `indices built: ${extend.size} extend, ${expando.size} expando, ${proto.size} proto, ${identifier.size} id, ${Date.now() - started}ms`
             );
-            cachedIndex = { program, extend, expando, proto };
+            cachedIndex = { program, extend, expando, proto, identifier };
         }
 
         const getExtendIndex = (): ExtendIndex => {
@@ -78,6 +85,10 @@ function init(modules: { typescript: typeof tslib }) {
         const getProtoIndex = (): PrototypeIndex => {
             ensureIndex();
             return cachedIndex!.proto;
+        };
+        const getIdentifierIndex = (): IdentifierIndex => {
+            ensureIndex();
+            return cachedIndex!.identifier;
         };
 
         // ─── Safety wrapper ──────────────────────────────────────────────────
@@ -108,7 +119,7 @@ function init(modules: { typescript: typeof tslib }) {
                 const ctx =
                     locateThisMember(ts, ls, getExtendIndex, getExpandoIndex, fileName, position) ??
                     locateChainedMember(
-                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, fileName, position
+                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex, fileName, position
                     );
                 if (ctx) {
                     log(`def: resolved ${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
@@ -136,7 +147,7 @@ function init(modules: { typescript: typeof tslib }) {
                 const ctx =
                     locateThisMember(ts, ls, getExtendIndex, getExpandoIndex, fileName, position) ??
                     locateChainedMember(
-                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, fileName, position
+                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex, fileName, position
                     );
                 if (ctx) {
                     return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
@@ -160,7 +171,7 @@ function init(modules: { typescript: typeof tslib }) {
                 const ctx =
                     locateThisMember(ts, ls, getExtendIndex, getExpandoIndex, fileName, position) ??
                     locateChainedMember(
-                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, fileName, position
+                        ts, ls, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex, fileName, position
                     );
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
@@ -205,7 +216,7 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getCompletionsAtPosition", () => {
                 const original = ls.getCompletionsAtPosition(fileName, position, options, formatOptions);
                 const extras = collectMemberCompletions(
-                    ts, ls, getExtendIndex, getExpandoIndex, getProtoIndex, fileName, position
+                    ts, ls, getExtendIndex, getExpandoIndex, getProtoIndex, getIdentifierIndex, fileName, position
                 );
                 if (extras.length === 0) return original;
                 if (!original) {

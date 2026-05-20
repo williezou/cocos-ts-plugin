@@ -17,6 +17,7 @@ import type {
     ExtendMemberContext,
     GetExpandoIndex,
     GetExtendIndex,
+    GetIdentifierIndex,
     GetProtoIndex,
     PrototypeIndex,
     ThisMemberContext,
@@ -202,6 +203,7 @@ export function collectMemberCompletions(
     getExtendIndex: GetExtendIndex,
     getExpandoIndex: GetExpandoIndex,
     getProtoIndex: GetProtoIndex,
+    getIdentifierIndex: GetIdentifierIndex,
     fileName: string,
     position: number
 ): tslib.CompletionEntry[] {
@@ -248,20 +250,31 @@ export function collectMemberCompletions(
     // 2. `<expr>.<field>.` (`this.m_layout.`, `this._spineAni.nodeDelay.`, …)
     if (ts.isPropertyAccessExpression(receiver)) {
         const className = resolveReceiverToClass(
-            ts, getExtendIndex, getProtoIndex, receiver, getExpandoIndex
+            ts, getExtendIndex, getProtoIndex, receiver, getExpandoIndex, getIdentifierIndex
         );
         if (className) {
-            enumerateClass(ts, getExtendIndex, className, push);
+            enumerateClass(ts, getExtendIndex, getProtoIndex, className, push);
             return out;
         }
         // otherwise fall through — receiver might be a plain dotted class name
     }
 
+    // 2b. Bare identifier (`shBeachMgr.`) — resolve through identifier index.
+    if (ts.isIdentifier(receiver)) {
+        const className = resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex, receiver, getExpandoIndex, getIdentifierIndex
+        );
+        if (className) {
+            enumerateClass(ts, getExtendIndex, getProtoIndex, className, push);
+            return out;
+        }
+    }
+
     // 3. `<dotted-class>.` — direct class members + expando children
     const dottedName = expressionToName(ts, receiver);
     if (dottedName) {
-        const className = lookupClassName(getExtendIndex(), dottedName);
-        if (className) enumerateClass(ts, getExtendIndex, className, push);
+        const className = lookupClassName(getExtendIndex(), dottedName, getProtoIndex());
+        if (className) enumerateClass(ts, getExtendIndex, getProtoIndex, className, push);
 
         const expando = getExpandoIndex();
         const prefix = dottedName + ".";
@@ -298,20 +311,25 @@ function enumerateLiteralAndChain(
 function enumerateClass(
     ts: typeof tslib,
     getIndex: GetExtendIndex,
+    getProtoIndex: GetProtoIndex,
     className: string,
     push: (name: string, kind: tslib.ScriptElementKind) => void
 ): void {
     const entries = getIndex().get(className);
-    if (!entries || entries.length === 0) return;
-    for (const entry of entries) {
-        for (const prop of entry.literal.properties) {
-            const n = getPropertyName(ts, prop);
-            if (n) push(n, classifyPropertyKind(ts, prop));
+    if (entries && entries.length > 0) {
+        for (const entry of entries) {
+            for (const prop of entry.literal.properties) {
+                const n = getPropertyName(ts, prop);
+                if (n) push(n, classifyPropertyKind(ts, prop));
+            }
         }
+        if (entries[0].parentName) {
+            walkChainEnumerate(ts, getIndex, entries[0].parentName, push);
+        }
+        return;
     }
-    if (entries[0].parentName) {
-        walkChainEnumerate(ts, getIndex, entries[0].parentName, push);
-    }
+    // Prototype/constructor-style class (no extend literal).
+    enumerateProtoChain(ts, getProtoIndex, className, push);
 }
 
 function walkChainEnumerate(
