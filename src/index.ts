@@ -72,7 +72,7 @@ function init(modules: { typescript: typeof tslib }) {
                     return original;
                 }
                 const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
                 if (ctx) {
                     log(`def: resolved ${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
                     return buildDefinition(ts, ctx);
@@ -96,7 +96,7 @@ function init(modules: { typescript: typeof tslib }) {
                 const original = ls.getDefinitionAtPosition(fileName, position);
                 if (original && original.length > 0) return original;
                 const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
                 if (ctx) {
                     return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
                 }
@@ -116,7 +116,7 @@ function init(modules: { typescript: typeof tslib }) {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
                 if (original && !isAnyQuickInfo(ts, original)) return original;
                 const ctx = locateThisMember(ts, ls, getExtendIndexNow, fileName, position)
-                    ?? locateChainedMember(ts, ls, getExtendIndexNow, fileName, position);
+                    ?? locateChainedMember(ts, ls, getExtendIndexNow, getProtoIndex, fileName, position);
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
                     return buildQuickInfo(ts, ls, ctx) ?? original;
@@ -677,6 +677,7 @@ function locateChainedMember(
     ts: typeof tslib,
     ls: tslib.LanguageService,
     getIndex: () => ExtendIndex,
+    getProtoIndex: () => PrototypeIndex,
     fileName: string,
     position: number
 ): ThisMemberContext | undefined {
@@ -695,7 +696,7 @@ function locateChainedMember(
     const receiver = parent.expression;
     if (receiver.kind === ts.SyntaxKind.ThisKeyword) return undefined; // handled by locateThisMember
 
-    const className = resolveReceiverToClass(ts, getIndex, receiver);
+    const className = resolveReceiverToClass(ts, getIndex, getProtoIndex, receiver);
     if (!className) return undefined;
 
     const memberName = node.text;
@@ -712,33 +713,114 @@ function locateChainedMember(
 
 function resolveReceiverToClass(
     ts: typeof tslib,
-    getIndex: () => ExtendIndex,
+    getExtendIndex: () => ExtendIndex,
+    getProtoIndex: () => PrototypeIndex,
     receiver: tslib.Expression
 ): string | undefined {
-    // Case A: `this.<member>` — read the type hint from `member`'s initializer in the
-    // enclosing extend literal (and its parent chain).
+    // Case A: `this.<member>` — find <member>'s initializer somewhere in the class
+    // (extend literal, prototype index, or constructor-body `this.<member> =`) and
+    // infer the class from that initializer.
     if (
         ts.isPropertyAccessExpression(receiver) &&
         receiver.expression.kind === ts.SyntaxKind.ThisKeyword
     ) {
+        const memberName = receiver.name.text;
+
+        // A1: extend-literal field (`m_layout: ccui.layout` style)
         const literal = findEnclosingExtendLiteral(ts, receiver);
-        if (!literal) return undefined;
-        const hit = lookupInLiteralAndChain(ts, getIndex, literal, receiver.name.text);
-        if (!hit) return undefined;
-        const prop = hit.property;
-        const init = ts.isPropertyAssignment(prop) ? prop.initializer : undefined;
-        if (!init) return undefined;
-        const hintName = expressionToName(ts, init);
-        if (!hintName) return undefined;
-        return lookupClassName(getIndex(), hintName);
+        if (literal) {
+            const hit = lookupInLiteralAndChain(ts, getExtendIndex, literal, memberName);
+            if (hit && ts.isPropertyAssignment(hit.property)) {
+                const cls = extractClassFromInitializer(
+                    ts,
+                    hit.property.initializer,
+                    getExtendIndex
+                );
+                if (cls) return cls;
+            }
+        }
+
+        // A2: prototype / constructor-body assignments (`this._spineAni = ...`)
+        const ownerClass = findPrototypeOwnerClass(ts, receiver);
+        if (ownerClass) {
+            const members = collectProtoMembers(getProtoIndex(), ownerClass, memberName);
+            for (const m of members) {
+                const cls = extractClassFromInitializer(ts, m.initializer, getExtendIndex);
+                if (cls) return cls;
+            }
+        }
+        return undefined;
     }
     // Case B: receiver is a dotted name that matches a known class directly.
     const direct = expressionToName(ts, receiver);
     if (direct) {
-        const found = lookupClassName(getIndex(), direct);
+        const found = lookupClassName(getExtendIndex(), direct);
         if (found) return found;
     }
     return undefined;
+}
+
+/**
+ * Heuristic: turn an assignment RHS into a class name in the extend index.
+ *   - `<X>` identifier or dotted name -> X (type-hint convention)
+ *   - `new <X>(...)` -> X
+ *   - `<X>.create(...)` / `<X>.createWithXxx(...)` etc. -> X (cocos factory convention)
+ *   - null / unrecognized -> undefined (caller skips and tries next initializer)
+ */
+function extractClassFromInitializer(
+    ts: typeof tslib,
+    init: tslib.Expression | undefined,
+    getExtendIndex: () => ExtendIndex
+): string | undefined {
+    if (!init) return undefined;
+    if (init.kind === ts.SyntaxKind.NullKeyword) return undefined;
+    if (init.kind === ts.SyntaxKind.UndefinedKeyword) return undefined;
+
+    // Bare identifier / dotted name: `m_layout: ccui.layout`
+    const direct = expressionToName(ts, init);
+    if (direct) {
+        const found = lookupClassName(getExtendIndex(), direct);
+        if (found) return found;
+    }
+    // `new <X>(...)`
+    if (ts.isNewExpression(init)) {
+        const ctorName = expressionToName(ts, init.expression);
+        if (ctorName) {
+            const found = lookupClassName(getExtendIndex(), ctorName);
+            if (found) return found;
+        }
+    }
+    // `<X>.<factory>(...)` — convention says the call returns an instance of X
+    if (ts.isCallExpression(init) && ts.isPropertyAccessExpression(init.expression)) {
+        const receiverName = expressionToName(ts, init.expression.expression);
+        if (receiverName) {
+            const found = lookupClassName(getExtendIndex(), receiverName);
+            if (found) return found;
+        }
+    }
+    return undefined;
+}
+
+function collectProtoMembers(
+    index: PrototypeIndex,
+    startClass: string,
+    memberName: string
+): PrototypeMember[] {
+    const out: PrototypeMember[] = [];
+    const seen = new Set<string>();
+    const queue: string[] = [startClass];
+    while (queue.length > 0) {
+        const cls = queue.shift()!;
+        if (seen.has(cls)) continue;
+        seen.add(cls);
+        const entry = index.get(cls);
+        if (!entry) continue;
+        for (const m of entry.members) {
+            if (m.memberName === memberName) out.push(m);
+        }
+        for (const p of entry.parents) queue.push(p);
+    }
+    return out;
 }
 
 /**
@@ -1094,7 +1176,7 @@ function collectMemberCompletions(
         ts.isPropertyAccessExpression(receiver) &&
         receiver.expression.kind === ts.SyntaxKind.ThisKeyword
     ) {
-        const className = resolveReceiverToClass(ts, getExtendIndex, receiver);
+        const className = resolveReceiverToClass(ts, getExtendIndex, getProtoIndex, receiver);
         if (className) {
             enumerateClass(ts, getExtendIndex, className, push);
         }
