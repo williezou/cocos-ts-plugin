@@ -270,6 +270,24 @@ function collectEntries(
                 addToIndex(extendIndex, node.name.text, makeEntry(ts, node.name.text, node.initializer, sf));
             }
         }
+        // `this.X = <value>` inside a constructor-bound function -> proto member
+        if (
+            ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isPropertyAccessExpression(node.left) &&
+            node.left.expression.kind === ts.SyntaxKind.ThisKeyword
+        ) {
+            const owner = findPrototypeOwnerClass(ts, node);
+            if (owner) {
+                addProtoMember(protoIndex, {
+                    className: owner,
+                    memberName: node.left.name.text,
+                    nameNode: node.left.name,
+                    initializer: node.right,
+                    sourceFile: sf,
+                });
+            }
+        }
         // <LHS> = <RHS>
         if (
             ts.isBinaryExpression(node) &&
@@ -553,50 +571,84 @@ function locateThisProtoMember(
 }
 
 /**
- * Walks up from `start` until it finds a FunctionExpression / ArrowFunction whose
- * placement identifies a class via the prototype pattern.
+ * Walks outward from `start` through every enclosing function, returning the first
+ * one whose placement identifies a class. Patterns recognized:
+ *   - <Class>.prototype.<m> = function () {...}        (prototype method)
+ *   - <Class>.prototype = { <m>: function () {} }       (prototype literal method)
+ *   - function <Class>() {...}                          (constructor declaration)
+ *   - let|var|const <Class> = function () {...}         (constructor expression)
+ *   - <Class> = function () {...}                       (constructor assignment)
+ *
+ * The outward walk is required because methods are often defined as
+ *   this.foo = function () {...}
+ * inside a constructor's body — `this.bar()` inside that nested function still
+ * binds to the outer constructor's class.
  */
 function findPrototypeOwnerClass(ts: typeof tslib, start: tslib.Node): string | undefined {
     let cur: tslib.Node | undefined = start.parent;
     while (cur) {
-        if (ts.isFunctionExpression(cur) || ts.isArrowFunction(cur) || ts.isFunctionDeclaration(cur)) {
-            const fn: tslib.Node = cur;
-            const fp = fn.parent;
-            if (!fp) {
-                cur = fn.parent;
-                continue;
-            }
-            // <Class>.prototype.<member> = function () {...}
-            if (
-                ts.isBinaryExpression(fp) &&
-                fp.right === fn &&
-                fp.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-                ts.isPropertyAccessExpression(fp.left) &&
-                ts.isPropertyAccessExpression(fp.left.expression) &&
-                fp.left.expression.name.text === "prototype"
-            ) {
-                return expressionToName(ts, fp.left.expression.expression);
-            }
-            // <Class>.prototype = { name: function () {...} }
-            if (ts.isPropertyAssignment(fp) && fp.initializer === fn) {
-                const lit = fp.parent;
-                if (lit && ts.isObjectLiteralExpression(lit)) {
-                    const assign = lit.parent;
-                    if (
-                        assign &&
-                        ts.isBinaryExpression(assign) &&
-                        assign.right === lit &&
-                        assign.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-                        ts.isPropertyAccessExpression(assign.left) &&
-                        assign.left.name.text === "prototype"
-                    ) {
-                        return expressionToName(ts, assign.left.expression);
-                    }
-                }
-            }
+        if (
+            ts.isFunctionExpression(cur) ||
+            ts.isArrowFunction(cur) ||
+            ts.isFunctionDeclaration(cur)
+        ) {
+            const name = classNameForFunction(ts, cur);
+            if (name) return name;
         }
         cur = cur.parent;
     }
+    return undefined;
+}
+
+function classNameForFunction(ts: typeof tslib, fn: tslib.Node): string | undefined {
+    // function <Class>() {...}
+    if (ts.isFunctionDeclaration(fn) && fn.name) return fn.name.text;
+
+    const fp = fn.parent;
+    if (!fp) return undefined;
+
+    if (
+        ts.isBinaryExpression(fp) &&
+        fp.right === fn &&
+        fp.operatorToken.kind === ts.SyntaxKind.EqualsToken
+    ) {
+        const lhs = fp.left;
+        // <Class>.prototype.<m> = function () {...}
+        if (
+            ts.isPropertyAccessExpression(lhs) &&
+            ts.isPropertyAccessExpression(lhs.expression) &&
+            lhs.expression.name.text === "prototype"
+        ) {
+            return expressionToName(ts, lhs.expression.expression);
+        }
+        // <Class> = function () {...}  (e.g., `cc.Node = function () {}`)
+        const lhsName = expressionToName(ts, lhs);
+        if (lhsName) return lhsName;
+    }
+
+    // let|var|const <Class> = function () {...}
+    if (ts.isVariableDeclaration(fp) && fp.initializer === fn && ts.isIdentifier(fp.name)) {
+        return fp.name.text;
+    }
+
+    // <Class>.prototype = { <m>: function () {} }
+    if (ts.isPropertyAssignment(fp) && fp.initializer === fn) {
+        const lit = fp.parent;
+        if (lit && ts.isObjectLiteralExpression(lit)) {
+            const assign = lit.parent;
+            if (
+                assign &&
+                ts.isBinaryExpression(assign) &&
+                assign.right === lit &&
+                assign.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+                ts.isPropertyAccessExpression(assign.left) &&
+                assign.left.name.text === "prototype"
+            ) {
+                return expressionToName(ts, assign.left.expression);
+            }
+        }
+    }
+
     return undefined;
 }
 
