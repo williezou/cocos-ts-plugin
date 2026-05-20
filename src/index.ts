@@ -117,6 +117,37 @@ function init(modules: { typescript: typeof tslib }) {
                 return mergeReferences(ts, original, extra, memberCtx);
             }, ls.findReferences(fileName, position));
 
+        proxy.getCompletionsAtPosition = (fileName, position, options, formatOptions) =>
+            guard("getCompletionsAtPosition", () => {
+                const original = ls.getCompletionsAtPosition(fileName, position, options, formatOptions);
+                const extras = collectMemberCompletions(
+                    ts, ls, getExtendIndexNow, getExpandoIndex, fileName, position
+                );
+                if (extras.length === 0) return original;
+                if (!original) {
+                    return {
+                        isGlobalCompletion: false,
+                        isMemberCompletion: true,
+                        isNewIdentifierLocation: false,
+                        entries: extras,
+                    };
+                }
+                // Replace tsserver's low-confidence "warning" entries with ours when
+                // names collide, append the rest.
+                const indexByName = new Map<string, number>();
+                original.entries.forEach((e, i) => indexByName.set(e.name, i));
+                for (const extra of extras) {
+                    const idx = indexByName.get(extra.name);
+                    if (idx === undefined) {
+                        original.entries.push(extra);
+                        indexByName.set(extra.name, original.entries.length - 1);
+                    } else if (original.entries[idx].kind === ts.ScriptElementKind.warning) {
+                        original.entries[idx] = extra;
+                    }
+                }
+                return original;
+            }, ls.getCompletionsAtPosition(fileName, position, options, formatOptions));
+
         proxy.getReferencesAtPosition = (fileName, position) =>
             guard("getReferencesAtPosition", () => {
                 const original = ls.getReferencesAtPosition(fileName, position) ?? [];
@@ -679,6 +710,164 @@ function buildQuickInfoFromExpando(
         documentation: [],
         tags: [],
     };
+}
+
+function collectMemberCompletions(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getExtendIndex: () => ExtendIndex,
+    getExpandoIndex: () => ExpandoIndex,
+    fileName: string,
+    position: number
+): tslib.CompletionEntry[] {
+    const program = ls.getProgram();
+    if (!program) return [];
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return [];
+
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node) return [];
+
+    // The cursor sits inside a PropertyAccessExpression's `.name` slot (either an
+    // empty/incomplete identifier right after a `.`, or an in-progress identifier).
+    let parent = node.parent;
+    let access: tslib.PropertyAccessExpression | undefined;
+    if (parent && ts.isPropertyAccessExpression(parent) && parent.name === node) {
+        access = parent;
+    } else if (node && ts.isPropertyAccessExpression(node)) {
+        access = node;
+    }
+    if (!access) return [];
+
+    const receiver = access.expression;
+    const out: tslib.CompletionEntry[] = [];
+    const seen = new Set<string>();
+    const push = (name: string, kind: tslib.ScriptElementKind): void => {
+        if (seen.has(name)) return;
+        seen.add(name);
+        out.push({
+            name,
+            kind,
+            kindModifiers: "",
+            sortText: "0",
+        });
+    };
+
+    // 1. `this.` -> enumerate enclosing extend literal + chain
+    if (receiver.kind === ts.SyntaxKind.ThisKeyword) {
+        const literal = findEnclosingExtendLiteral(ts, access);
+        if (literal) enumerateLiteralAndChain(ts, getExtendIndex, literal, push);
+        return out;
+    }
+
+    // 2. `this.<field>.` -> resolve field's type hint, enumerate that class
+    if (
+        ts.isPropertyAccessExpression(receiver) &&
+        receiver.expression.kind === ts.SyntaxKind.ThisKeyword
+    ) {
+        const className = resolveReceiverToClass(ts, getExtendIndex, receiver);
+        if (className) {
+            enumerateClass(ts, getExtendIndex, className, push);
+        }
+        return out;
+    }
+
+    // 3. Dotted name (`sp.SkeletonAnimation.`, `cc.Node.`, etc.)
+    const dottedName = expressionToName(ts, receiver);
+    if (dottedName) {
+        // 3a. If the dotted name itself is a known class, enumerate its literal members.
+        const className = lookupClassName(getExtendIndex(), dottedName);
+        if (className) enumerateClass(ts, getExtendIndex, className, push);
+
+        // 3b. Enumerate expando children: any indexed `<dottedName>.<tail>` with no
+        // further dots in the tail.
+        const expando = getExpandoIndex();
+        const prefix = dottedName + ".";
+        for (const [key, entries] of expando) {
+            if (!key.startsWith(prefix)) continue;
+            const tail = key.substring(prefix.length);
+            if (tail.length === 0 || tail.includes(".")) continue;
+            const init = entries[0]?.initializer;
+            const kind =
+                init && (ts.isFunctionExpression(init) || ts.isArrowFunction(init))
+                    ? ts.ScriptElementKind.memberFunctionElement
+                    : ts.ScriptElementKind.memberVariableElement;
+            push(tail, kind);
+        }
+    }
+
+    return out;
+}
+
+function enumerateLiteralAndChain(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    literal: tslib.ObjectLiteralExpression,
+    push: (name: string, kind: tslib.ScriptElementKind) => void
+): void {
+    for (const prop of literal.properties) {
+        const n = getPropertyName(ts, prop);
+        if (n) push(n, classifyPropertyKind(ts, prop));
+    }
+    const owner = getLiteralOwner(ts, literal);
+    if (!owner || !owner.parentName) return;
+    walkChainEnumerate(ts, getIndex, owner.parentName, push);
+}
+
+function enumerateClass(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    className: string,
+    push: (name: string, kind: tslib.ScriptElementKind) => void
+): void {
+    const entries = getIndex().get(className);
+    if (!entries || entries.length === 0) return;
+    for (const entry of entries) {
+        for (const prop of entry.literal.properties) {
+            const n = getPropertyName(ts, prop);
+            if (n) push(n, classifyPropertyKind(ts, prop));
+        }
+    }
+    if (entries[0].parentName) {
+        walkChainEnumerate(ts, getIndex, entries[0].parentName, push);
+    }
+}
+
+function walkChainEnumerate(
+    ts: typeof tslib,
+    getIndex: () => ExtendIndex,
+    startParent: string,
+    push: (name: string, kind: tslib.ScriptElementKind) => void
+): void {
+    const index = getIndex();
+    const seen = new Set<string>();
+    let parentName: string | undefined = startParent;
+    while (parentName && !seen.has(parentName)) {
+        seen.add(parentName);
+        const entries = index.get(parentName);
+        if (!entries || entries.length === 0) return;
+        for (const entry of entries) {
+            for (const prop of entry.literal.properties) {
+                const n = getPropertyName(ts, prop);
+                if (n) push(n, classifyPropertyKind(ts, prop));
+            }
+        }
+        parentName = entries[0].parentName;
+    }
+}
+
+function classifyPropertyKind(
+    ts: typeof tslib,
+    prop: tslib.ObjectLiteralElementLike
+): tslib.ScriptElementKind {
+    if (ts.isMethodDeclaration(prop)) return ts.ScriptElementKind.memberFunctionElement;
+    if (ts.isPropertyAssignment(prop)) {
+        const init = prop.initializer;
+        if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) {
+            return ts.ScriptElementKind.memberFunctionElement;
+        }
+    }
+    return ts.ScriptElementKind.memberVariableElement;
 }
 
 function buildDefinition(
