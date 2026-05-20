@@ -8,7 +8,20 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.1.2");
+        log("plugin loaded v0.2.0");
+
+        let cachedIndex: { program: tslib.Program; index: ExtendIndex } | undefined;
+
+        const getIndex = (): ExtendIndex => {
+            const program = ls.getProgram();
+            if (!program) return new Map();
+            if (cachedIndex && cachedIndex.program === program) return cachedIndex.index;
+            const started = Date.now();
+            const index = buildExtendIndex(ts, program);
+            log(`built extend index: ${index.size} classes, ${Date.now() - started}ms`);
+            cachedIndex = { program, index };
+            return index;
+        };
 
         const guard = <T>(name: string, fn: () => T, fallback: T): T => {
             try {
@@ -31,12 +44,12 @@ function init(modules: { typescript: typeof tslib }) {
                 if (original && original.definitions && original.definitions.length > 0) {
                     return original;
                 }
-                const ctx = locateThisMember(ts, ls, fileName, position);
+                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
                 if (!ctx) {
                     log(`def: no extend-this context at ${fileName}:${position}`);
                     return original;
                 }
-                log(`def: resolved this.${ctx.memberName} -> offset ${ctx.propertyNameNode.getStart(ctx.sourceFile)}`);
+                log(`def: resolved this.${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
                 return buildDefinition(ts, ctx);
             }, ls.getDefinitionAndBoundSpan(fileName, position));
 
@@ -44,7 +57,7 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getDefinitionAtPosition", () => {
                 const original = ls.getDefinitionAtPosition(fileName, position);
                 if (original && original.length > 0) return original;
-                const ctx = locateThisMember(ts, ls, fileName, position);
+                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
                 if (!ctx) return undefined;
                 const built = buildDefinition(ts, ctx);
                 return built?.definitions as tslib.DefinitionInfo[] | undefined;
@@ -54,7 +67,7 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getQuickInfoAtPosition", () => {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
                 if (original && !isAnyQuickInfo(ts, original)) return original;
-                const ctx = locateThisMember(ts, ls, fileName, position);
+                const ctx = locateThisMember(ts, ls, getIndex, fileName, position);
                 if (!ctx) return original;
                 log(`hover: resolving this.${ctx.memberName}`);
                 return buildQuickInfo(ts, ls, ctx) ?? original;
@@ -94,18 +107,111 @@ interface ThisMemberContext {
     memberName: string;
     property: tslib.ObjectLiteralElementLike;
     propertyNameNode: tslib.Node;
+    /** Where `property` lives — same as `sourceFile` for own members, different for inherited. */
+    propertySourceFile: tslib.SourceFile;
 }
 
 interface ExtendMemberContext {
     sourceFile: tslib.SourceFile;
     memberName: string;
-    /** The identifier node at the cursor (either `xxx` in `this.xxx` or `xxx:` in literal). */
     identifier: tslib.Identifier;
+}
+
+interface ExtendEntry {
+    className: string;
+    parentName: string | undefined;
+    literal: tslib.ObjectLiteralExpression;
+    sourceFile: tslib.SourceFile;
+}
+
+type ExtendIndex = Map<string, ExtendEntry[]>;
+
+function buildExtendIndex(ts: typeof tslib, program: tslib.Program): ExtendIndex {
+    const index: ExtendIndex = new Map();
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        collectExtendEntries(ts, sf, index);
+    }
+    return index;
+}
+
+function collectExtendEntries(
+    ts: typeof tslib,
+    sf: tslib.SourceFile,
+    index: ExtendIndex
+): void {
+    function visit(node: tslib.Node): void {
+        // let/var/const <name> = <expr>.extend({...})
+        if (ts.isVariableDeclaration(node) && node.initializer && isExtendCallWithLiteral(ts, node.initializer)) {
+            if (ts.isIdentifier(node.name)) {
+                addExtendEntry(index, node.name.text, makeEntry(ts, node.name.text, node.initializer, sf));
+            }
+        }
+        // <LHS> = <expr>.extend({...})  (assignment expression)
+        if (
+            ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            isExtendCallWithLiteral(ts, node.right)
+        ) {
+            const className = expressionToName(ts, node.left);
+            if (className) {
+                addExtendEntry(index, className, makeEntry(ts, className, node.right, sf));
+            }
+        }
+        ts.forEachChild(node, visit);
+    }
+    visit(sf);
+}
+
+function isExtendCallWithLiteral(
+    ts: typeof tslib,
+    node: tslib.Expression
+): node is tslib.CallExpression {
+    return (
+        ts.isCallExpression(node) &&
+        isExtendCall(ts, node) &&
+        node.arguments.length > 0 &&
+        ts.isObjectLiteralExpression(node.arguments[0])
+    );
+}
+
+function makeEntry(
+    ts: typeof tslib,
+    className: string,
+    callExpr: tslib.CallExpression,
+    sf: tslib.SourceFile
+): ExtendEntry {
+    const parentExpr = (callExpr.expression as tslib.PropertyAccessExpression).expression;
+    return {
+        className,
+        parentName: expressionToName(ts, parentExpr),
+        literal: callExpr.arguments[0] as tslib.ObjectLiteralExpression,
+        sourceFile: sf,
+    };
+}
+
+function addExtendEntry(index: ExtendIndex, key: string, entry: ExtendEntry): void {
+    let arr = index.get(key);
+    if (!arr) {
+        arr = [];
+        index.set(key, arr);
+    }
+    arr.push(entry);
+}
+
+function expressionToName(ts: typeof tslib, node: tslib.Node): string | undefined {
+    if (ts.isIdentifier(node)) return node.text;
+    if (ts.isPropertyAccessExpression(node)) {
+        const parent = expressionToName(ts, node.expression);
+        return parent ? `${parent}.${node.name.text}` : undefined;
+    }
+    return undefined;
 }
 
 function locateThisMember(
     ts: typeof tslib,
     ls: tslib.LanguageService,
+    getIndex: () => ExtendIndex,
     fileName: string,
     position: number
 ): ThisMemberContext | undefined {
@@ -127,17 +233,81 @@ function locateThisMember(
     const literal = findEnclosingExtendLiteral(ts, parent);
     if (!literal) return undefined;
 
-    const property = findPropertyByName(ts, literal, memberName);
-    if (!property) return undefined;
-    const propertyNameNode = (property as any).name ?? property;
+    // 1. Check the same literal first.
+    const directProp = findPropertyByName(ts, literal, memberName);
+    if (directProp) {
+        return makeContext(sourceFile, node, memberName, directProp, sourceFile);
+    }
 
+    // 2. Walk the parent-class chain.
+    const owner = getLiteralOwner(ts, literal);
+    if (!owner || !owner.parentName) return undefined;
+
+    const index = getIndex();
+    const seen = new Set<string>();
+    let parentName: string | undefined = owner.parentName;
+    while (parentName && !seen.has(parentName)) {
+        seen.add(parentName);
+        const entries = index.get(parentName);
+        if (!entries || entries.length === 0) return undefined;
+        for (const entry of entries) {
+            const prop = findPropertyByName(ts, entry.literal, memberName);
+            if (prop) {
+                return makeContext(sourceFile, node, memberName, prop, entry.sourceFile);
+            }
+        }
+        parentName = entries[0].parentName;
+    }
+    return undefined;
+}
+
+function makeContext(
+    sourceFile: tslib.SourceFile,
+    identifier: tslib.Identifier,
+    memberName: string,
+    property: tslib.ObjectLiteralElementLike,
+    propertySourceFile: tslib.SourceFile
+): ThisMemberContext {
+    const propertyNameNode = (property as any).name ?? property;
     return {
         sourceFile,
-        identifier: node,
+        identifier,
         memberName,
         property,
         propertyNameNode,
+        propertySourceFile,
     };
+}
+
+function getLiteralOwner(
+    ts: typeof tslib,
+    literal: tslib.ObjectLiteralExpression
+): { className: string; parentName: string | undefined } | undefined {
+    const callExpr = literal.parent;
+    if (!callExpr || !ts.isCallExpression(callExpr)) return undefined;
+
+    const callParent = callExpr.parent;
+    if (!callParent) return undefined;
+
+    let lhsExpr: tslib.Node | undefined;
+    if (ts.isVariableDeclaration(callParent) && callParent.initializer === callExpr) {
+        if (!ts.isIdentifier(callParent.name)) return undefined;
+        lhsExpr = callParent.name;
+    } else if (
+        ts.isBinaryExpression(callParent) &&
+        callParent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        callParent.right === callExpr
+    ) {
+        lhsExpr = callParent.left;
+    } else {
+        return undefined;
+    }
+
+    const className = expressionToName(ts, lhsExpr);
+    if (!className) return undefined;
+
+    const parentExpr = (callExpr.expression as tslib.PropertyAccessExpression).expression;
+    return { className, parentName: expressionToName(ts, parentExpr) };
 }
 
 /**
@@ -162,7 +332,6 @@ function resolveExtendMember(
     const parent = node.parent;
     if (!parent) return undefined;
 
-    // Case 1: this.xxx
     if (
         ts.isPropertyAccessExpression(parent) &&
         parent.name === node &&
@@ -172,7 +341,6 @@ function resolveExtendMember(
         return { sourceFile, memberName: node.text, identifier: node };
     }
 
-    // Case 2: property name in extend literal
     if (
         (ts.isPropertyAssignment(parent) ||
             ts.isMethodDeclaration(parent) ||
@@ -219,17 +387,17 @@ function buildDefinition(
     ts: typeof tslib,
     ctx: ThisMemberContext
 ): tslib.DefinitionInfoAndBoundSpan {
-    const { sourceFile, identifier, memberName, propertyNameNode } = ctx;
+    const { sourceFile, identifier, memberName, propertyNameNode, propertySourceFile } = ctx;
     const sourceStart = identifier.getStart(sourceFile);
     const sourceLength = identifier.getEnd() - sourceStart;
-    const destStart = propertyNameNode.getStart(sourceFile);
+    const destStart = propertyNameNode.getStart(propertySourceFile);
     const destLength = propertyNameNode.getEnd() - destStart;
 
     return {
         textSpan: { start: sourceStart, length: sourceLength },
         definitions: [
             {
-                fileName: sourceFile.fileName,
+                fileName: propertySourceFile.fileName,
                 textSpan: { start: destStart, length: destLength },
                 kind: ts.ScriptElementKind.memberVariableElement,
                 name: memberName,
@@ -314,7 +482,6 @@ function scanExtendReferences(
     for (const sf of program.getSourceFiles()) {
         if (sf.isDeclarationFile) continue;
         walkExtendLiterals(ts, sf, (literal) => {
-            // 1. Property declarations matching the name.
             for (const prop of literal.properties) {
                 if (getPropertyName(ts, prop) !== memberName) continue;
                 const nameNode = (prop as any).name as tslib.Node | undefined;
@@ -326,7 +493,6 @@ function scanExtendReferences(
                     isWriteAccess: true,
                 });
             }
-            // 2. this.xxx accesses inside the literal.
             walkThisAccesses(ts, literal, memberName, (id) => {
                 const start = id.getStart(sf);
                 refs.push({
@@ -341,7 +507,6 @@ function scanExtendReferences(
 }
 
 function isWriteAccessOfPropertyAccess(ts: typeof tslib, id: tslib.Identifier): boolean {
-    // id is the .name of a PropertyAccessExpression; check if it's the LHS of an assignment.
     const access = id.parent;
     if (!access) return false;
     const assign = access.parent;
@@ -515,8 +680,6 @@ function findNodeAtPosition(
     sourceFile: tslib.SourceFile,
     position: number
 ): tslib.Node | undefined {
-    // Allow position == node.getEnd() so the cursor "just past" an identifier
-    // (e.g., right before a `:` or `(`) still resolves to that identifier.
     function visit(node: tslib.Node): tslib.Node | undefined {
         if (position < node.getStart(sourceFile) || position > node.getEnd()) {
             return undefined;
