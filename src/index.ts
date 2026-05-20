@@ -8,9 +8,14 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.3.0");
+        log("plugin loaded v0.4.0");
 
-        let cachedIndex: { program: tslib.Program; extend: ExtendIndex; expando: ExpandoIndex } | undefined;
+        let cachedIndex: {
+            program: tslib.Program;
+            extend: ExtendIndex;
+            expando: ExpandoIndex;
+            proto: PrototypeIndex;
+        } | undefined;
 
         const getExtendIndexNow = (): ExtendIndex => {
             ensureIndex();
@@ -20,18 +25,29 @@ function init(modules: { typescript: typeof tslib }) {
             ensureIndex();
             return cachedIndex!.expando;
         };
+        const getProtoIndex = (): PrototypeIndex => {
+            ensureIndex();
+            return cachedIndex!.proto;
+        };
 
         function ensureIndex(): void {
             const program = ls.getProgram();
             if (!program) {
-                cachedIndex = { program: program!, extend: new Map(), expando: new Map() };
+                cachedIndex = {
+                    program: program!,
+                    extend: new Map(),
+                    expando: new Map(),
+                    proto: new Map(),
+                };
                 return;
             }
             if (cachedIndex && cachedIndex.program === program) return;
             const started = Date.now();
-            const { extend, expando } = buildIndices(ts, program);
-            log(`indices built: ${extend.size} extend classes, ${expando.size} expando paths, ${Date.now() - started}ms`);
-            cachedIndex = { program, extend, expando };
+            const { extend, expando, proto } = buildIndices(ts, program);
+            log(
+                `indices built: ${extend.size} extend, ${expando.size} expando, ${proto.size} proto, ${Date.now() - started}ms`
+            );
+            cachedIndex = { program, extend, expando, proto };
         }
 
         const guard = <T>(name: string, fn: () => T, fallback: T): T => {
@@ -61,6 +77,11 @@ function init(modules: { typescript: typeof tslib }) {
                     log(`def: resolved ${ctx.memberName} -> ${ctx.propertySourceFile.fileName}:${ctx.propertyNameNode.getStart(ctx.propertySourceFile)}`);
                     return buildDefinition(ts, ctx);
                 }
+                const proto = locateThisProtoMember(ts, ls, getProtoIndex, fileName, position);
+                if (proto) {
+                    log(`def: resolved ${proto.fullName} -> ${proto.entry.sourceFile.fileName}:${proto.entry.nameNode.getStart(proto.entry.sourceFile)}`);
+                    return buildDefinitionFromExpando(ts, proto);
+                }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
                 if (dotted) {
                     log(`def: resolved ${dotted.fullName} -> ${dotted.entry.sourceFile.fileName}:${dotted.entry.nameNode.getStart(dotted.entry.sourceFile)}`);
@@ -79,6 +100,10 @@ function init(modules: { typescript: typeof tslib }) {
                 if (ctx) {
                     return buildDefinition(ts, ctx).definitions as tslib.DefinitionInfo[];
                 }
+                const proto = locateThisProtoMember(ts, ls, getProtoIndex, fileName, position);
+                if (proto) {
+                    return buildDefinitionFromExpando(ts, proto).definitions as tslib.DefinitionInfo[];
+                }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
                 if (dotted) {
                     return buildDefinitionFromExpando(ts, dotted).definitions as tslib.DefinitionInfo[];
@@ -95,6 +120,11 @@ function init(modules: { typescript: typeof tslib }) {
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
                     return buildQuickInfo(ts, ls, ctx) ?? original;
+                }
+                const proto = locateThisProtoMember(ts, ls, getProtoIndex, fileName, position);
+                if (proto) {
+                    log(`hover: resolving ${proto.fullName}`);
+                    return buildQuickInfoFromExpando(ts, ls, proto) ?? original;
                 }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
                 if (dotted) {
@@ -121,7 +151,7 @@ function init(modules: { typescript: typeof tslib }) {
             guard("getCompletionsAtPosition", () => {
                 const original = ls.getCompletionsAtPosition(fileName, position, options, formatOptions);
                 const extras = collectMemberCompletions(
-                    ts, ls, getExtendIndexNow, getExpandoIndex, fileName, position
+                    ts, ls, getExtendIndexNow, getExpandoIndex, getProtoIndex, fileName, position
                 );
                 if (extras.length === 0) return original;
                 if (!original) {
@@ -197,24 +227,41 @@ interface ExpandoEntry {
 
 type ExpandoIndex = Map<string, ExpandoEntry[]>;
 
+interface PrototypeMember {
+    className: string;
+    memberName: string;
+    nameNode: tslib.Node;
+    initializer: tslib.Expression;
+    sourceFile: tslib.SourceFile;
+}
+
+interface PrototypeIndexEntry {
+    members: PrototypeMember[];
+    parents: string[];
+}
+
+type PrototypeIndex = Map<string, PrototypeIndexEntry>;
+
 function buildIndices(
     ts: typeof tslib,
     program: tslib.Program
-): { extend: ExtendIndex; expando: ExpandoIndex } {
+): { extend: ExtendIndex; expando: ExpandoIndex; proto: PrototypeIndex } {
     const extend: ExtendIndex = new Map();
     const expando: ExpandoIndex = new Map();
+    const proto: PrototypeIndex = new Map();
     for (const sf of program.getSourceFiles()) {
         if (sf.isDeclarationFile) continue;
-        collectEntries(ts, sf, extend, expando);
+        collectEntries(ts, sf, extend, expando, proto);
     }
-    return { extend, expando };
+    return { extend, expando, proto };
 }
 
 function collectEntries(
     ts: typeof tslib,
     sf: tslib.SourceFile,
     extendIndex: ExtendIndex,
-    expandoIndex: ExpandoIndex
+    expandoIndex: ExpandoIndex,
+    protoIndex: PrototypeIndex
 ): void {
     function visit(node: tslib.Node): void {
         // let/var/const <name> = <expr>.extend({...})
@@ -228,6 +275,8 @@ function collectEntries(
             ts.isBinaryExpression(node) &&
             node.operatorToken.kind === ts.SyntaxKind.EqualsToken
         ) {
+            collectPrototypeEntry(ts, node, sf, protoIndex);
+
             const lhsName = expressionToName(ts, node.left);
             if (lhsName) {
                 if (isExtendCallWithLiteral(ts, node.right)) {
@@ -269,6 +318,111 @@ function collectEntries(
         ts.forEachChild(node, visit);
     }
     visit(sf);
+}
+
+/**
+ * Detects classical-prototype patterns and records them in `protoIndex`:
+ *   - `<Class>.prototype.<member> = <value>` -> single member
+ *   - `<Class>.prototype = <Other>.prototype | new Other(...) | Object.create(Other.prototype)` -> parent link
+ *   - `<Class>.prototype = { ...literal... }` -> each property becomes a member
+ */
+function collectPrototypeEntry(
+    ts: typeof tslib,
+    node: tslib.BinaryExpression,
+    sf: tslib.SourceFile,
+    protoIndex: PrototypeIndex
+): void {
+    if (!ts.isPropertyAccessExpression(node.left)) return;
+    const lhs = node.left;
+
+    // Case A: <X>.prototype.<member> = <expr>
+    if (ts.isPropertyAccessExpression(lhs.expression) && lhs.expression.name.text === "prototype") {
+        const className = expressionToName(ts, lhs.expression.expression);
+        if (!className) return;
+        addProtoMember(protoIndex, {
+            className,
+            memberName: lhs.name.text,
+            nameNode: lhs.name,
+            initializer: node.right,
+            sourceFile: sf,
+        });
+        return;
+    }
+
+    // Case B: <X>.prototype = ...
+    if (lhs.name.text === "prototype") {
+        const className = expressionToName(ts, lhs.expression);
+        if (!className) return;
+
+        const parent = extractPrototypeParent(ts, node.right);
+        if (parent) addProtoParent(protoIndex, className, parent);
+
+        // Case B': <X>.prototype = { ...literal... }
+        if (ts.isObjectLiteralExpression(node.right)) {
+            for (const prop of node.right.properties) {
+                const memberName = getPropertyName(ts, prop);
+                const nameNode = (prop as any).name as tslib.Node | undefined;
+                if (!memberName || !nameNode) continue;
+                const init = ts.isPropertyAssignment(prop)
+                    ? prop.initializer
+                    : ts.isMethodDeclaration(prop)
+                    ? (prop as unknown as tslib.Expression)
+                    : undefined;
+                if (!init) continue;
+                addProtoMember(protoIndex, {
+                    className,
+                    memberName,
+                    nameNode,
+                    initializer: init,
+                    sourceFile: sf,
+                });
+            }
+        }
+    }
+}
+
+function extractPrototypeParent(ts: typeof tslib, expr: tslib.Expression): string | undefined {
+    // <Other>.prototype
+    if (ts.isPropertyAccessExpression(expr) && expr.name.text === "prototype") {
+        return expressionToName(ts, expr.expression);
+    }
+    // new <Other>(...)
+    if (ts.isNewExpression(expr)) {
+        return expressionToName(ts, expr.expression);
+    }
+    // Object.create(<Other>.prototype)
+    if (
+        ts.isCallExpression(expr) &&
+        ts.isPropertyAccessExpression(expr.expression) &&
+        expr.expression.name.text === "create" &&
+        ts.isIdentifier(expr.expression.expression) &&
+        expr.expression.expression.text === "Object" &&
+        expr.arguments.length > 0
+    ) {
+        const arg = expr.arguments[0];
+        if (ts.isPropertyAccessExpression(arg) && arg.name.text === "prototype") {
+            return expressionToName(ts, arg.expression);
+        }
+    }
+    return undefined;
+}
+
+function addProtoMember(index: PrototypeIndex, m: PrototypeMember): void {
+    let entry = index.get(m.className);
+    if (!entry) {
+        entry = { members: [], parents: [] };
+        index.set(m.className, entry);
+    }
+    entry.members.push(m);
+}
+
+function addProtoParent(index: PrototypeIndex, className: string, parentName: string): void {
+    let entry = index.get(className);
+    if (!entry) {
+        entry = { members: [], parents: [] };
+        index.set(className, entry);
+    }
+    if (!entry.parents.includes(parentName)) entry.parents.push(parentName);
 }
 
 function isExtendCallWithLiteral(
@@ -350,6 +504,123 @@ function locateThisMember(
  * names a class in the extend index, possibly via a project type-hint convention like
  * `m_layout: ccui.layout`). Walks the resolved class's extend chain to find `<sub>`.
  */
+/**
+ * Resolves `this.xxx` when the enclosing function is a classical-prototype method:
+ *   <Class>.prototype.someMethod = function () { this.xxx /* here *\/ }
+ *   <Class>.prototype = { someMethod: function () { this.xxx /* here *\/ } }
+ * Walks the prototype-parent chain (recorded from `<Class>.prototype = <Other>.prototype`
+ * et al.) to find `xxx`'s definition site.
+ */
+function locateThisProtoMember(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getProtoIndex: () => PrototypeIndex,
+    fileName: string,
+    position: number
+): DottedAccessHit | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    const parent = node.parent;
+    if (!parent || !ts.isPropertyAccessExpression(parent)) return undefined;
+    if (parent.name !== node) return undefined;
+    if (parent.expression.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
+
+    const className = findPrototypeOwnerClass(ts, parent);
+    if (!className) return undefined;
+
+    const member = lookupProtoMember(getProtoIndex(), className, node.text);
+    if (!member) return undefined;
+
+    // Reuse the DottedAccessHit shape so the existing expando builders can render
+    // definition + hover. `fullName` here is `<Class>.<member>` for hover display.
+    return {
+        sourceFile,
+        identifier: node,
+        fullName: `${className}.${node.text}`,
+        entry: {
+            fullName: `${className}.${node.text}`,
+            nameNode: member.nameNode,
+            initializer: member.initializer,
+            sourceFile: member.sourceFile,
+        },
+    };
+}
+
+/**
+ * Walks up from `start` until it finds a FunctionExpression / ArrowFunction whose
+ * placement identifies a class via the prototype pattern.
+ */
+function findPrototypeOwnerClass(ts: typeof tslib, start: tslib.Node): string | undefined {
+    let cur: tslib.Node | undefined = start.parent;
+    while (cur) {
+        if (ts.isFunctionExpression(cur) || ts.isArrowFunction(cur) || ts.isFunctionDeclaration(cur)) {
+            const fn: tslib.Node = cur;
+            const fp = fn.parent;
+            if (!fp) {
+                cur = fn.parent;
+                continue;
+            }
+            // <Class>.prototype.<member> = function () {...}
+            if (
+                ts.isBinaryExpression(fp) &&
+                fp.right === fn &&
+                fp.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+                ts.isPropertyAccessExpression(fp.left) &&
+                ts.isPropertyAccessExpression(fp.left.expression) &&
+                fp.left.expression.name.text === "prototype"
+            ) {
+                return expressionToName(ts, fp.left.expression.expression);
+            }
+            // <Class>.prototype = { name: function () {...} }
+            if (ts.isPropertyAssignment(fp) && fp.initializer === fn) {
+                const lit = fp.parent;
+                if (lit && ts.isObjectLiteralExpression(lit)) {
+                    const assign = lit.parent;
+                    if (
+                        assign &&
+                        ts.isBinaryExpression(assign) &&
+                        assign.right === lit &&
+                        assign.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+                        ts.isPropertyAccessExpression(assign.left) &&
+                        assign.left.name.text === "prototype"
+                    ) {
+                        return expressionToName(ts, assign.left.expression);
+                    }
+                }
+            }
+        }
+        cur = cur.parent;
+    }
+    return undefined;
+}
+
+function lookupProtoMember(
+    index: PrototypeIndex,
+    startClass: string,
+    memberName: string
+): PrototypeMember | undefined {
+    const seen = new Set<string>();
+    const queue: string[] = [startClass];
+    while (queue.length > 0) {
+        const cls = queue.shift()!;
+        if (seen.has(cls)) continue;
+        seen.add(cls);
+        const entry = index.get(cls);
+        if (!entry) continue;
+        for (const m of entry.members) {
+            if (m.memberName === memberName) return m;
+        }
+        for (const p of entry.parents) queue.push(p);
+    }
+    return undefined;
+}
+
 function locateChainedMember(
     ts: typeof tslib,
     ls: tslib.LanguageService,
@@ -717,6 +988,7 @@ function collectMemberCompletions(
     ls: tslib.LanguageService,
     getExtendIndex: () => ExtendIndex,
     getExpandoIndex: () => ExpandoIndex,
+    getProtoIndex: () => PrototypeIndex,
     fileName: string,
     position: number
 ): tslib.CompletionEntry[] {
@@ -753,10 +1025,15 @@ function collectMemberCompletions(
         });
     };
 
-    // 1. `this.` -> enumerate enclosing extend literal + chain
+    // 1. `this.` -> enumerate enclosing extend literal + chain, or prototype chain
     if (receiver.kind === ts.SyntaxKind.ThisKeyword) {
         const literal = findEnclosingExtendLiteral(ts, access);
-        if (literal) enumerateLiteralAndChain(ts, getExtendIndex, literal, push);
+        if (literal) {
+            enumerateLiteralAndChain(ts, getExtendIndex, literal, push);
+            return out;
+        }
+        const protoClass = findPrototypeOwnerClass(ts, access);
+        if (protoClass) enumerateProtoChain(ts, getProtoIndex, protoClass, push);
         return out;
     }
 
@@ -797,6 +1074,32 @@ function collectMemberCompletions(
     }
 
     return out;
+}
+
+function enumerateProtoChain(
+    ts: typeof tslib,
+    getIndex: () => PrototypeIndex,
+    startClass: string,
+    push: (name: string, kind: tslib.ScriptElementKind) => void
+): void {
+    const index = getIndex();
+    const seen = new Set<string>();
+    const queue: string[] = [startClass];
+    while (queue.length > 0) {
+        const cls = queue.shift()!;
+        if (seen.has(cls)) continue;
+        seen.add(cls);
+        const entry = index.get(cls);
+        if (!entry) continue;
+        for (const m of entry.members) {
+            const isFn = ts.isFunctionExpression(m.initializer) || ts.isArrowFunction(m.initializer);
+            push(
+                m.memberName,
+                isFn ? ts.ScriptElementKind.memberFunctionElement : ts.ScriptElementKind.memberVariableElement
+            );
+        }
+        for (const p of entry.parents) queue.push(p);
+    }
 }
 
 function enumerateLiteralAndChain(
