@@ -254,11 +254,60 @@ function buildIndices(
     const extend: ExtendIndex = new Map();
     const expando: ExpandoIndex = new Map();
     const proto: PrototypeIndex = new Map();
+    // Pass 1: declared classes, expando assignments, prototype patterns.
     for (const sf of program.getSourceFiles()) {
         if (sf.isDeclarationFile) continue;
         collectEntries(ts, sf, extend, expando, proto);
     }
+    // Pass 2: ad-hoc fields tacked on at runtime
+    // (`this._spineAni.nodeDelay = new cc.Node()`, etc.). These need pass-1
+    // indices to resolve the receiver's class, so they get a second walk
+    // and are folded into the expando index.
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        collectAugmentedFields(ts, sf, extend, expando, proto);
+    }
     return { extend, expando, proto };
+}
+
+function collectAugmentedFields(
+    ts: typeof tslib,
+    sf: tslib.SourceFile,
+    extend: ExtendIndex,
+    expando: ExpandoIndex,
+    proto: PrototypeIndex
+): void {
+    function visit(node: tslib.Node): void {
+        if (
+            ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isPropertyAccessExpression(node.left) &&
+            ts.isPropertyAccessExpression(node.left.expression)
+        ) {
+            // LHS is `<sub>.<field>` where <sub> is itself a PropertyAccessExpression.
+            // (We skip the simple `this.<field>` and `a.b = ...` cases — those are
+            // already handled by collectPrototypeEntry and the basic expando branch.)
+            const receiver = node.left.expression;
+            const fieldName = node.left.name.text;
+            const className = resolveReceiverToClass(
+                ts,
+                () => extend,
+                () => proto,
+                receiver,
+                () => expando
+            );
+            if (!className) return;
+            const key = `${className}.${fieldName}`;
+            addToIndex(expando, key, {
+                fullName: key,
+                nameNode: node.left.name,
+                initializer: node.right,
+                sourceFile: sf,
+            });
+        }
+        ts.forEachChild(node, visit);
+    }
+    visit(sf);
 }
 
 function collectEntries(
@@ -703,7 +752,7 @@ function locateChainedMember(
     const receiver = parent.expression;
     if (receiver.kind === ts.SyntaxKind.ThisKeyword) return undefined; // handled by locateThisMember
 
-    const className = resolveReceiverToClass(ts, getIndex, getProtoIndex, receiver);
+    const className = resolveReceiverToClass(ts, getIndex, getProtoIndex, receiver, getExpandoIndex);
     if (!className) return undefined;
 
     const memberName = node.text;
@@ -727,11 +776,10 @@ function resolveReceiverToClass(
     ts: typeof tslib,
     getExtendIndex: () => ExtendIndex,
     getProtoIndex: () => PrototypeIndex,
-    receiver: tslib.Expression
+    receiver: tslib.Expression,
+    getExpandoIndex?: () => ExpandoIndex
 ): string | undefined {
-    // Case A: `this.<member>` — find <member>'s initializer somewhere in the class
-    // (extend literal, prototype index, or constructor-body `this.<member> =`) and
-    // infer the class from that initializer.
+    // Case A: `this.<member>`
     if (
         ts.isPropertyAccessExpression(receiver) &&
         receiver.expression.kind === ts.SyntaxKind.ThisKeyword
@@ -741,7 +789,7 @@ function resolveReceiverToClass(
         // A1: extend-literal field (`m_layout: ccui.layout` style)
         const literal = findEnclosingExtendLiteral(ts, receiver);
         if (literal) {
-            const hit = lookupInLiteralAndChain(ts, getExtendIndex, literal, memberName);
+            const hit = lookupInLiteralAndChain(ts, getExtendIndex, literal, memberName, getExpandoIndex);
             if (hit && hit.valueNode) {
                 const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex);
                 if (cls) return cls;
@@ -759,11 +807,45 @@ function resolveReceiverToClass(
         }
         return undefined;
     }
-    // Case B: receiver is a dotted name that matches a known class directly.
+
+    // Case B: dotted name that matches a known class directly (cc.Node, sp.SkeletonAnimation, ...)
     const direct = expressionToName(ts, receiver);
     if (direct) {
         const found = lookupClassName(getExtendIndex(), direct);
         if (found) return found;
+    }
+
+    // Case C: multi-level chain — `<sub>.<field>` where <sub> isn't `this`.
+    // Recursively resolve <sub> to a class, then look up <field>'s type hint
+    // in that class's chain (including augmented expando entries from pass 2).
+    if (ts.isPropertyAccessExpression(receiver)) {
+        const subClass = resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex, receiver.expression, getExpandoIndex
+        );
+        if (!subClass) return undefined;
+        const fieldName = receiver.name.text;
+
+        // Search subClass's extend chain (with expando augmentation per step).
+        const entries = getExtendIndex().get(subClass);
+        if (entries) {
+            for (const entry of entries) {
+                const hit = lookupInLiteralAndChain(
+                    ts, getExtendIndex, entry.literal, fieldName, getExpandoIndex
+                );
+                if (hit?.valueNode) {
+                    const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex);
+                    if (cls) return cls;
+                }
+            }
+        }
+        // Fall back to expando hit directly on subClass.
+        if (getExpandoIndex) {
+            const eHit = expandoHit(getExpandoIndex(), subClass, fieldName);
+            if (eHit?.valueNode) {
+                const cls = extractClassFromInitializer(ts, eHit.valueNode, getExtendIndex);
+                if (cls) return cls;
+            }
+        }
     }
     return undefined;
 }
@@ -1229,16 +1311,17 @@ function collectMemberCompletions(
         return out;
     }
 
-    // 2. `this.<field>.` -> resolve field's type hint, enumerate that class
-    if (
-        ts.isPropertyAccessExpression(receiver) &&
-        receiver.expression.kind === ts.SyntaxKind.ThisKeyword
-    ) {
-        const className = resolveReceiverToClass(ts, getExtendIndex, getProtoIndex, receiver);
+    // 2. `<expr>.<field>.` (`this.m_layout.`, `this._spineAni.nodeDelay.`, …)
+    // Recursively resolve <expr>.<field>'s class via type hints, then enumerate it.
+    if (ts.isPropertyAccessExpression(receiver)) {
+        const className = resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex, receiver, getExpandoIndex
+        );
         if (className) {
             enumerateClass(ts, getExtendIndex, className, push);
+            return out;
         }
-        return out;
+        // fall through if receiver is just a dotted class name (handled below)
     }
 
     // 3. Dotted name (`sp.SkeletonAnimation.`, `cc.Node.`, etc.)

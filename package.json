@@ -1,6 +1,6 @@
 {
   "name": "cocos-ts-plugin",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "TypeScript Language Service plugin that resolves `this.xxx` inside cocos2d-x / cocos2d-html5 cc.Class.extend({...}) literals — providing Go to Definition and hover info that tsserver alone can't compute.",
   "keywords": [
     "typescript",
