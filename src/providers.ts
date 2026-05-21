@@ -10,7 +10,7 @@ import {
     walkExtendLiterals,
     walkThisAccesses,
 } from "./ast";
-import { lookupClassName, resolveReceiverToClass } from "./resolver";
+import { extractClassFromInitializer, lookupClassName, resolveReceiverToClass } from "./resolver";
 import type {
     DottedAccessHit,
     ExtendIndex,
@@ -53,7 +53,9 @@ export function buildDefinition(
 export function buildQuickInfo(
     ts: typeof tslib,
     ls: tslib.LanguageService,
-    ctx: ThisMemberContext
+    ctx: ThisMemberContext,
+    getExtendIndex: GetExtendIndex,
+    getProtoIndex: GetProtoIndex
 ): tslib.QuickInfo | undefined {
     const program = ls.getProgram();
     if (!program) return undefined;
@@ -80,8 +82,15 @@ export function buildQuickInfo(
             kind = ts.ScriptElementKind.memberFunctionElement;
             label = "(method) ";
         } else {
-            const t = checker.getTypeAtLocation(valueNode);
-            typeStr = checker.typeToString(t);
+            // cocos 约定: `m_field: <ClassName>` 把字段类型注释为 <ClassName>。
+            // 先按约定解析；解析不出来才落回 TS checker（无注解、字面量等）。
+            const className = extractClassFromInitializer(ts, valueNode, getExtendIndex, getProtoIndex);
+            if (className) {
+                typeStr = className;
+            } else {
+                const t = checker.getTypeAtLocation(valueNode);
+                typeStr = checker.typeToString(t);
+            }
         }
     } else if (property && ts.isShorthandPropertyAssignment(property)) {
         const t = checker.getTypeAtLocation(property.name);
@@ -130,7 +139,9 @@ export function buildDefinitionFromExpando(
 export function buildQuickInfoFromExpando(
     ts: typeof tslib,
     ls: tslib.LanguageService,
-    hit: DottedAccessHit
+    hit: DottedAccessHit,
+    getExtendIndex: GetExtendIndex,
+    getProtoIndex: GetProtoIndex
 ): tslib.QuickInfo | undefined {
     const program = ls.getProgram();
     if (!program) return undefined;
@@ -151,8 +162,15 @@ export function buildQuickInfoFromExpando(
         kind = ts.ScriptElementKind.memberFunctionElement;
         label = "(method) ";
     } else {
-        const t = checker.getTypeAtLocation(init);
-        typeStr = checker.typeToString(t);
+        // cocos 约定：`a.b.c = <Class>` 把成员类型注释为 <Class>。
+        // 先按约定解析；解析不出来才落回 TS checker。
+        const className = extractClassFromInitializer(ts, init, getExtendIndex, getProtoIndex);
+        if (className) {
+            typeStr = className;
+        } else {
+            const t = checker.getTypeAtLocation(init);
+            typeStr = checker.typeToString(t);
+        }
     }
 
     return {

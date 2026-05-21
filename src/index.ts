@@ -175,17 +175,17 @@ function init(modules: { typescript: typeof tslib }) {
                     );
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
-                    return buildQuickInfo(ts, ls, ctx) ?? original;
+                    return buildQuickInfo(ts, ls, ctx, getExtendIndex, getProtoIndex) ?? original;
                 }
                 const proto = locateThisProtoMember(ts, ls, getProtoIndex, fileName, position);
                 if (proto) {
                     log(`hover: resolving ${proto.fullName}`);
-                    return buildQuickInfoFromExpando(ts, ls, proto) ?? original;
+                    return buildQuickInfoFromExpando(ts, ls, proto, getExtendIndex, getProtoIndex) ?? original;
                 }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
                 if (dotted) {
                     log(`hover: resolving ${dotted.fullName}`);
-                    return buildQuickInfoFromExpando(ts, ls, dotted) ?? original;
+                    return buildQuickInfoFromExpando(ts, ls, dotted, getExtendIndex, getProtoIndex) ?? original;
                 }
                 return original;
             }, ls.getQuickInfoAtPosition(fileName, position));
