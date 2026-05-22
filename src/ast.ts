@@ -155,6 +155,16 @@ export function classNameForFunction(
             ) {
                 return expressionToName(ts, assign.left.expression);
             }
+            // let <Class> = <Parent>.extend({ <method>: function () { this.X = ... } })
+            if (
+                assign &&
+                ts.isCallExpression(assign) &&
+                assign.arguments[0] === lit &&
+                isExtendCall(ts, assign)
+            ) {
+                const owner = getLiteralOwner(ts, lit);
+                if (owner) return owner.className;
+            }
         }
     }
 
