@@ -10,14 +10,20 @@ import {
     resolveExtendMember,
 } from "./resolver";
 import {
+    buildCallHierarchyItem,
     buildDefinition,
     buildDefinitionFromExpando,
     buildQuickInfo,
     buildQuickInfoFromExpando,
     collectMemberCompletions,
+    collectExpandoImplementations,
+    collectExpandoIncomingCalls,
+    collectPrototypeImplementations,
+    collectPrototypeIncomingCalls,
     dedupeReferences,
     isAnyQuickInfo,
     mergeExpandoReferences,
+    mergeImplementations,
     mergeReferences,
     scanExpandoReferences,
     scanExtendReferences,
@@ -47,7 +53,7 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.1.15");
+        log("plugin loaded v0.1.16");
 
         // ─── Index cache ─────────────────────────────────────────────────────
         let cachedIndex: {
@@ -269,6 +275,78 @@ function init(modules: { typescript: typeof tslib }) {
                 }
                 return original.length ? original : undefined;
             }, ls.getReferencesAtPosition(fileName, position));
+
+        proxy.getImplementationAtPosition = (fileName, position) =>
+            guard("getImplementationAtPosition", () => {
+                const original = ls.getImplementationAtPosition(fileName, position);
+                const protoCtx = locatePrototypeMember(
+                    ts, ls, getProtoIndex, fileName, position
+                );
+                if (protoCtx) {
+                    const dot = protoCtx.fullName.lastIndexOf(".");
+                    const extra = collectPrototypeImplementations(
+                        ts,
+                        getProtoIndex,
+                        protoCtx.fullName.substring(0, dot),
+                        protoCtx.fullName.substring(dot + 1)
+                    );
+                    log(`impl: ${protoCtx.fullName} -> tsserver=${original?.length ?? 0}, indexed=${extra.length}`);
+                    return mergeImplementations(original, extra);
+                }
+
+                const expandoCtx = locateExpandoMember(
+                    ts, ls, getExpandoIndex, fileName, position
+                );
+                if (expandoCtx) {
+                    const extra = collectExpandoImplementations(
+                        ts, getExpandoIndex, expandoCtx.fullName
+                    );
+                    log(`impl: ${expandoCtx.fullName} -> tsserver=${original?.length ?? 0}, indexed=${extra.length}`);
+                    return mergeImplementations(original, extra);
+                }
+                return original;
+            }, ls.getImplementationAtPosition(fileName, position));
+
+        if (ls.prepareCallHierarchy && ls.provideCallHierarchyIncomingCalls) {
+            proxy.prepareCallHierarchy = (fileName, position) =>
+                guard("prepareCallHierarchy", () => {
+                    const original = ls.prepareCallHierarchy(fileName, position);
+                    if (original && (!Array.isArray(original) || original.length > 0)) {
+                        return original;
+                    }
+                    const ctx =
+                        locatePrototypeMember(ts, ls, getProtoIndex, fileName, position) ??
+                        locateExpandoMember(ts, ls, getExpandoIndex, fileName, position);
+                    return ctx ? buildCallHierarchyItem(ts, ctx) : undefined;
+                }, ls.prepareCallHierarchy(fileName, position));
+
+            proxy.provideCallHierarchyIncomingCalls = (fileName, position) =>
+                guard("provideCallHierarchyIncomingCalls", () => {
+                    const original = ls.provideCallHierarchyIncomingCalls(fileName, position);
+                    if (original.length > 0) return original;
+
+                    const protoCtx = locatePrototypeMember(
+                        ts, ls, getProtoIndex, fileName, position
+                    );
+                    if (protoCtx) {
+                        const dot = protoCtx.fullName.lastIndexOf(".");
+                        return collectPrototypeIncomingCalls(
+                            ts,
+                            ls,
+                            getProtoIndex,
+                            protoCtx.fullName.substring(0, dot),
+                            protoCtx.fullName.substring(dot + 1)
+                        );
+                    }
+
+                    const expandoCtx = locateExpandoMember(
+                        ts, ls, getExpandoIndex, fileName, position
+                    );
+                    return expandoCtx
+                        ? collectExpandoIncomingCalls(ts, ls, expandoCtx.fullName)
+                        : original;
+                }, ls.provideCallHierarchyIncomingCalls(fileName, position));
+        }
 
         proxy.getCompletionsAtPosition = (fileName, position, options, formatOptions) =>
             guard("getCompletionsAtPosition", () => {

@@ -645,6 +645,306 @@ export function mergeExpandoReferences(
     return [{ definition, references: refs }];
 }
 
+// ─── Implementations ────────────────────────────────────────────────────────
+
+export function collectPrototypeImplementations(
+    ts: typeof tslib,
+    getProtoIndex: GetProtoIndex,
+    className: string,
+    memberName: string
+): tslib.ImplementationLocation[] {
+    const index = getProtoIndex();
+    const out: tslib.ImplementationLocation[] = [];
+
+    for (const [candidateClass, entry] of index) {
+        if (!prototypeClassIsOrExtends(index, candidateClass, className)) continue;
+        for (const member of entry.members) {
+            if (member.memberName !== memberName) continue;
+            out.push(buildImplementationLocation(
+                ts,
+                member.sourceFile,
+                member.nameNode,
+                member.initializer,
+                `${member.className}.${member.memberName}`
+            ));
+        }
+    }
+    return dedupeImplementations(out);
+}
+
+export function collectExpandoImplementations(
+    ts: typeof tslib,
+    getExpandoIndex: GetExpandoIndex,
+    fullName: string
+): tslib.ImplementationLocation[] {
+    const entries = getExpandoIndex().get(fullName) ?? [];
+    return dedupeImplementations(entries.map((entry) =>
+        buildImplementationLocation(
+            ts,
+            entry.sourceFile,
+            entry.nameNode,
+            entry.initializer,
+            fullName
+        )
+    ));
+}
+
+export function mergeImplementations(
+    original: readonly tslib.ImplementationLocation[] | undefined,
+    extra: tslib.ImplementationLocation[]
+): readonly tslib.ImplementationLocation[] | undefined {
+    const merged = dedupeImplementations([...(original ?? []), ...extra]);
+    return merged.length > 0 ? merged : original;
+}
+
+function buildImplementationLocation(
+    ts: typeof tslib,
+    sourceFile: tslib.SourceFile,
+    nameNode: tslib.Node,
+    initializer: tslib.Node,
+    displayName: string
+): tslib.ImplementationLocation {
+    const nameStart = nameNode.getStart(sourceFile);
+    const contextStart = Math.min(nameStart, initializer.getStart(sourceFile));
+    const contextEnd = Math.max(nameNode.getEnd(), initializer.getEnd());
+    const isFunction =
+        ts.isFunctionExpression(initializer) ||
+        ts.isArrowFunction(initializer) ||
+        ts.isMethodDeclaration(initializer);
+    return {
+        fileName: sourceFile.fileName,
+        textSpan: { start: nameStart, length: nameNode.getEnd() - nameStart },
+        contextSpan: { start: contextStart, length: contextEnd - contextStart },
+        kind: isFunction
+            ? ts.ScriptElementKind.memberFunctionElement
+            : ts.ScriptElementKind.memberVariableElement,
+        displayParts: [{ text: displayName, kind: isFunction ? "methodName" : "propertyName" }],
+    };
+}
+
+function prototypeClassIsOrExtends(
+    index: PrototypeIndex,
+    candidateClass: string,
+    targetClass: string
+): boolean {
+    const seen = new Set<string>();
+    const queue = [candidateClass];
+    while (queue.length > 0) {
+        const className = queue.shift()!;
+        if (className === targetClass) return true;
+        if (seen.has(className)) continue;
+        seen.add(className);
+        const entry = index.get(className);
+        if (entry) queue.push(...entry.parents);
+    }
+    return false;
+}
+
+function dedupeImplementations(
+    implementations: readonly tslib.ImplementationLocation[]
+): tslib.ImplementationLocation[] {
+    const seen = new Set<string>();
+    const out: tslib.ImplementationLocation[] = [];
+    for (const implementation of implementations) {
+        const key = `${implementation.fileName}:${implementation.textSpan.start}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(implementation);
+    }
+    return out;
+}
+
+// ─── Call hierarchy ─────────────────────────────────────────────────────────
+
+export function buildCallHierarchyItem(
+    ts: typeof tslib,
+    ctx: DottedAccessHit
+): tslib.CallHierarchyItem {
+    const sf = ctx.entry.sourceFile;
+    const nameNode = ctx.entry.nameNode;
+    const init = ctx.entry.initializer;
+    const dot = ctx.fullName.lastIndexOf(".");
+    const selectionStart = nameNode.getStart(sf);
+    // VS Code requires selectionSpan to be contained by span. For expando and
+    // prototype assignments the member name is before the RHS function, so a
+    // span starting at `function` is invalid and the UI silently shows no item.
+    const spanStart = Math.min(selectionStart, init.getStart(sf));
+    const spanEnd = Math.max(nameNode.getEnd(), init.getEnd());
+    return {
+        name: dot >= 0 ? ctx.fullName.substring(dot + 1) : ctx.fullName,
+        kind:
+            ts.isFunctionExpression(init) || ts.isArrowFunction(init) || ts.isMethodDeclaration(init)
+                ? ts.ScriptElementKind.memberFunctionElement
+                : ts.ScriptElementKind.memberVariableElement,
+        kindModifiers: "",
+        file: sf.fileName,
+        span: { start: spanStart, length: spanEnd - spanStart },
+        selectionSpan: {
+            start: selectionStart,
+            length: nameNode.getEnd() - selectionStart,
+        },
+        containerName: dot >= 0 ? ctx.fullName.substring(0, dot) : undefined,
+    };
+}
+
+export function collectExpandoIncomingCalls(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    fullName: string
+): tslib.CallHierarchyIncomingCall[] {
+    return collectIncomingCalls(ts, ls, (access) => expressionToName(ts, access) === fullName);
+}
+
+export function collectPrototypeIncomingCalls(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getProtoIndex: GetProtoIndex,
+    className: string,
+    memberName: string
+): tslib.CallHierarchyIncomingCall[] {
+    const index = getProtoIndex();
+    return collectIncomingCalls(ts, ls, (access) => {
+        if (!ts.isIdentifier(access.name) || access.name.text !== memberName) return false;
+        const ownerClass = findPrototypeOwnerClass(ts, access);
+        const resolved = ownerClass
+            ? lookupProtoMember(index, ownerClass, memberName)
+            : undefined;
+        return resolved?.className === className;
+    });
+}
+
+function collectIncomingCalls(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    matches: (access: tslib.PropertyAccessExpression) => boolean
+): tslib.CallHierarchyIncomingCall[] {
+    const program = ls.getProgram();
+    if (!program) return [];
+    const grouped = new Map<string, tslib.CallHierarchyIncomingCall>();
+
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        function visit(node: tslib.Node): void {
+            if (
+                ts.isCallExpression(node) &&
+                ts.isPropertyAccessExpression(node.expression) &&
+                matches(node.expression)
+            ) {
+                const access = node.expression;
+                const caller = callHierarchyCaller(ts, access, sf);
+                const key = `${caller.file}:${caller.selectionSpan.start}`;
+                let incoming = grouped.get(key);
+                if (!incoming) {
+                    incoming = { from: caller, fromSpans: [] };
+                    grouped.set(key, incoming);
+                }
+                const start = access.name.getStart(sf);
+                incoming.fromSpans.push({
+                    start,
+                    length: access.name.getEnd() - start,
+                });
+            }
+            ts.forEachChild(node, visit);
+        }
+        visit(sf);
+    }
+    return [...grouped.values()];
+}
+
+function callHierarchyCaller(
+    ts: typeof tslib,
+    callSite: tslib.Node,
+    sf: tslib.SourceFile
+): tslib.CallHierarchyItem {
+    let cur: tslib.Node | undefined = callSite.parent;
+    while (cur && cur !== sf) {
+        if (
+            ts.isFunctionDeclaration(cur) ||
+            ts.isFunctionExpression(cur) ||
+            ts.isArrowFunction(cur) ||
+            ts.isMethodDeclaration(cur)
+        ) {
+            const item = namedFunctionCallHierarchyItem(ts, cur, sf);
+            if (item) return item;
+        }
+        cur = cur.parent;
+    }
+
+    const fileName = sf.fileName.split(/[\\/]/).pop() ?? sf.fileName;
+    return {
+        name: fileName,
+        kind: ts.ScriptElementKind.scriptElement,
+        kindModifiers: "",
+        file: sf.fileName,
+        span: { start: 0, length: sf.getEnd() },
+        selectionSpan: { start: 0, length: 0 },
+    };
+}
+
+function namedFunctionCallHierarchyItem(
+    ts: typeof tslib,
+    fn: tslib.FunctionDeclaration | tslib.FunctionExpression | tslib.ArrowFunction | tslib.MethodDeclaration,
+    sf: tslib.SourceFile
+): tslib.CallHierarchyItem | undefined {
+    let nameNode: tslib.Node | undefined;
+    let name: string | undefined;
+    let containerName: string | undefined;
+
+    if ((ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn)) && fn.name) {
+        nameNode = fn.name;
+        name = nodeName(ts, fn.name);
+    } else {
+        const parent = fn.parent;
+        if (ts.isVariableDeclaration(parent) && ts.isIdentifier(parent.name)) {
+            nameNode = parent.name;
+            name = parent.name.text;
+        } else if (ts.isPropertyAssignment(parent)) {
+            nameNode = parent.name;
+            name = nodeName(ts, parent.name);
+        } else if (
+            ts.isBinaryExpression(parent) &&
+            parent.right === fn &&
+            parent.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        ) {
+            const fullName = expressionToName(ts, parent.left);
+            if (fullName) {
+                const dot = fullName.lastIndexOf(".");
+                name = dot >= 0 ? fullName.substring(dot + 1) : fullName;
+                containerName = dot >= 0
+                    ? fullName.substring(0, dot).replace(/\.prototype$/, "")
+                    : undefined;
+                nameNode = ts.isPropertyAccessExpression(parent.left)
+                    ? parent.left.name
+                    : parent.left;
+            }
+        }
+    }
+    if (!nameNode || !name) return undefined;
+
+    const selectionStart = nameNode.getStart(sf);
+    const spanStart = Math.min(selectionStart, fn.getStart(sf));
+    const spanEnd = Math.max(nameNode.getEnd(), fn.getEnd());
+    return {
+        name,
+        kind: ts.ScriptElementKind.functionElement,
+        kindModifiers: "",
+        file: sf.fileName,
+        span: { start: spanStart, length: spanEnd - spanStart },
+        selectionSpan: {
+            start: selectionStart,
+            length: nameNode.getEnd() - selectionStart,
+        },
+        containerName,
+    };
+}
+
+function nodeName(ts: typeof tslib, node: tslib.Node): string | undefined {
+    if (ts.isIdentifier(node) || ts.isStringLiteral(node) || ts.isNumericLiteral(node)) {
+        return node.text;
+    }
+    return undefined;
+}
+
 export function dedupeReferences(refs: tslib.ReferenceEntry[]): tslib.ReferenceEntry[] {
     const seen = new Set<string>();
     const out: tslib.ReferenceEntry[] = [];

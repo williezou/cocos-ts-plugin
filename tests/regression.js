@@ -181,6 +181,76 @@ Midautumn26Entrance.prototype._updateEndingTip = function () {};
             expected
         );
     }
+
+    const item = plugin.prepareCallHierarchy(fileName, declaration + 1);
+    assert.ok(item && !Array.isArray(item));
+    assert.equal(item.name, "_updateEndingTip");
+    assert.equal(item.selectionSpan.start, declaration);
+
+    const incoming = plugin.provideCallHierarchyIncomingCalls(fileName, declaration + 1);
+    assert.equal(incoming.length, 1);
+    assert.equal(incoming[0].from.name, "createBtn");
+    assert.deepEqual(
+        incoming[0].fromSpans.map((span) => span.start).sort((a, b) => a - b),
+        [firstCall, secondCall]
+    );
+}
+
+{
+    const source = `
+let Midautumn26Entrance = function () {};
+Midautumn26Entrance.prototype._onButtonClicked = function () {
+    this.showPopup();
+};
+Midautumn26Entrance.prototype.showPopup = function () {};
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const declaration = source.lastIndexOf("showPopup");
+    const call = source.indexOf("showPopup");
+    const memberLength = "showPopup".length;
+    const expectedReferences = [call, declaration];
+
+    // VS Code commonly sends the position immediately after the identifier,
+    // so cover both the declaration and call-site token boundaries.
+    for (const queryPosition of [
+        declaration + memberLength,
+        call + memberLength,
+    ]) {
+        const references = plugin.getReferencesAtPosition(fileName, queryPosition) ?? [];
+        assert.deepEqual(
+            references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            expectedReferences
+        );
+
+        const symbols = plugin.findReferences(fileName, queryPosition);
+        assert.ok(symbols && symbols.length > 0);
+        assert.deepEqual(
+            symbols[0].references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            expectedReferences
+        );
+
+        const implementations = plugin.getImplementationAtPosition(fileName, queryPosition) ?? [];
+        assert.deepEqual(
+            implementations.map((impl) => impl.textSpan.start),
+            [declaration]
+        );
+
+        const item = plugin.prepareCallHierarchy(fileName, queryPosition);
+        assert.ok(item && !Array.isArray(item));
+        assert.equal(item.name, "showPopup");
+        assert.ok(item.span.start <= item.selectionSpan.start);
+        assert.ok(
+            item.selectionSpan.start + item.selectionSpan.length <=
+            item.span.start + item.span.length
+        );
+    }
+
+    const incoming = plugin.provideCallHierarchyIncomingCalls(
+        fileName, declaration + memberLength
+    );
+    assert.equal(incoming.length, 1);
+    assert.equal(incoming[0].from.name, "_onButtonClicked");
+    assert.deepEqual(incoming[0].fromSpans.map((span) => span.start), [call]);
 }
 
 console.log("regression tests passed");
