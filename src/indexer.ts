@@ -99,7 +99,8 @@ function collectEntries(
                 node.name.text,
                 node.initializer,
                 sf,
-                expandoIndex
+                expandoIndex,
+                node.name
             );
         }
         // `this.X = <value>` inside a constructor-bound function -> proto member
@@ -152,7 +153,14 @@ function collectEntries(
                 // `a.b = { foo: ... }` and `Config = { foo: ... }` -> index
                 // each member. The latter is common when a global config is
                 // declared first and populated later.
-                collectObjectLiteralInitializers(ts, lhsName, node.right, sf, expandoIndex);
+                collectObjectLiteralInitializers(
+                    ts,
+                    lhsName,
+                    node.right,
+                    sf,
+                    expandoIndex,
+                    ts.isIdentifier(node.left) ? node.left : undefined
+                );
             }
         }
         ts.forEachChild(node, visit);
@@ -170,7 +178,8 @@ function collectObjectLiteralInitializers(
     ownerName: string,
     initializer: tslib.Expression,
     sf: tslib.SourceFile,
-    expandoIndex: ExpandoIndex
+    expandoIndex: ExpandoIndex,
+    ownerNameNode?: tslib.Node
 ): void {
     if (ts.isParenthesizedExpression(initializer)) {
         collectObjectLiteralInitializers(
@@ -178,11 +187,23 @@ function collectObjectLiteralInitializers(
             ownerName,
             initializer.expression,
             sf,
-            expandoIndex
+            expandoIndex,
+            ownerNameNode
         );
         return;
     }
     if (ts.isObjectLiteralExpression(initializer)) {
+        // Keep a definition for the object itself as well as its members. This
+        // lets the receiver in `enumValue.member` resolve when the legacy
+        // global was introduced by a bare `enumValue = { ... }` assignment.
+        if (ownerNameNode) {
+            addToIndex(expandoIndex, ownerName, {
+                fullName: ownerName,
+                nameNode: ownerNameNode,
+                initializer,
+                sourceFile: sf,
+            });
+        }
         collectObjectLiteralMembers(ts, ownerName, initializer, sf, expandoIndex);
         return;
     }
@@ -192,14 +213,22 @@ function collectObjectLiteralInitializers(
             op === ts.SyntaxKind.BarBarToken ||
             op === ts.SyntaxKind.QuestionQuestionToken
         ) {
-            collectObjectLiteralInitializers(ts, ownerName, initializer.left, sf, expandoIndex);
-            collectObjectLiteralInitializers(ts, ownerName, initializer.right, sf, expandoIndex);
+            collectObjectLiteralInitializers(
+                ts, ownerName, initializer.left, sf, expandoIndex, ownerNameNode
+            );
+            collectObjectLiteralInitializers(
+                ts, ownerName, initializer.right, sf, expandoIndex, ownerNameNode
+            );
         }
         return;
     }
     if (ts.isConditionalExpression(initializer)) {
-        collectObjectLiteralInitializers(ts, ownerName, initializer.whenTrue, sf, expandoIndex);
-        collectObjectLiteralInitializers(ts, ownerName, initializer.whenFalse, sf, expandoIndex);
+        collectObjectLiteralInitializers(
+            ts, ownerName, initializer.whenTrue, sf, expandoIndex, ownerNameNode
+        );
+        collectObjectLiteralInitializers(
+            ts, ownerName, initializer.whenFalse, sf, expandoIndex, ownerNameNode
+        );
     }
 }
 

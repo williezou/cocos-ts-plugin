@@ -197,11 +197,19 @@ export function locateDottedAccess(
 
     const parent = node.parent;
     if (!parent || !ts.isPropertyAccessExpression(parent)) return undefined;
-    if (parent.name !== node) return undefined;
-    if (parent.expression.kind === ts.SyntaxKind.ThisKeyword) return undefined;
 
-    const fullName = expressionToName(ts, parent);
-    if (!fullName || !fullName.includes(".")) return undefined;
+    let fullName: string | undefined;
+    if (parent.name === node) {
+        if (parent.expression.kind === ts.SyntaxKind.ThisKeyword) return undefined;
+        fullName = expressionToName(ts, parent);
+    } else if (parent.expression === node) {
+        // Cursor is on the receiver in `enumValue.member`. Object-literal
+        // assignments are indexed under their bare owner name as well.
+        fullName = node.text;
+    } else {
+        return undefined;
+    }
+    if (!fullName) return undefined;
 
     const entries = getIndex().get(fullName);
     if (!entries || entries.length === 0) return undefined;

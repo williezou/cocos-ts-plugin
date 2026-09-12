@@ -151,9 +151,11 @@ export function buildQuickInfoFromExpando(
     const sourceStart = identifier.getStart(sourceFile);
     const sourceLength = identifier.getEnd() - sourceStart;
 
-    let label = "(property) ";
+    let label = fullName.includes(".") ? "(property) " : "(var) ";
     let typeStr: string;
-    let kind: tslib.ScriptElementKind = ts.ScriptElementKind.memberVariableElement;
+    let kind: tslib.ScriptElementKind = fullName.includes(".")
+        ? ts.ScriptElementKind.memberVariableElement
+        : ts.ScriptElementKind.variableElement;
 
     const init = entry.initializer;
     if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) {

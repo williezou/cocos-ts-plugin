@@ -42,7 +42,7 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.1.13");
+        log("plugin loaded v0.1.14");
 
         // ─── Index cache ─────────────────────────────────────────────────────
         let cachedIndex: {

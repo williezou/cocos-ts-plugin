@@ -96,4 +96,29 @@ Midautumn26Config.bundle.bundleNames.poster;
     assert.equal(source.slice(target.start, target.start + target.length), propertyName);
 }
 
+{
+    const source = `
+enumSeasonNodeType = {
+    pointsRewards: "pointsRewards",
+};
+enumSeasonNodeType.pointsRewards;
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const ownerName = "enumSeasonNodeType";
+    const usageStart = source.lastIndexOf(ownerName);
+
+    const definition = plugin.getDefinitionAndBoundSpan(fileName, usageStart + 1);
+    assert.ok(definition && definition.definitions && definition.definitions.length > 0);
+    const target = definition.definitions[0].textSpan;
+    assert.equal(source.slice(target.start, target.start + target.length), ownerName);
+
+    const quickInfo = plugin.getQuickInfoAtPosition(fileName, usageStart + 1);
+    const hover = quickInfo && quickInfo.displayParts
+        ? quickInfo.displayParts.map((part) => part.text).join("")
+        : "";
+    assert.match(hover, /^\(var\) enumSeasonNodeType:/);
+    assert.doesNotMatch(hover, /:\s*any\s*$/);
+    assert.match(hover, /pointsRewards/);
+}
+
 console.log("regression tests passed");
