@@ -203,12 +203,25 @@ Midautumn26Entrance.prototype._onButtonClicked = function () {
     this.showPopup();
 };
 Midautumn26Entrance.prototype.showPopup = function () {};
+Midautumn26Config = {
+    showPopup: function () {},
+};
+function invokeDynamic(handler) {
+    handler.handler.showPopup();
+    Midautumn26Config.showPopup();
+}
 `;
     const { fileName, plugin } = createLanguageService(source);
-    const declaration = source.lastIndexOf("showPopup");
+    const declaration = source.indexOf("Midautumn26Entrance.prototype.showPopup") +
+        "Midautumn26Entrance.prototype.".length;
     const call = source.indexOf("showPopup");
+    const dynamicCall = source.indexOf("handler.handler.showPopup") +
+        "handler.handler.".length;
+    const configDeclaration = source.indexOf("showPopup: function");
+    const configCall = source.indexOf("Midautumn26Config.showPopup") +
+        "Midautumn26Config.".length;
     const memberLength = "showPopup".length;
-    const expectedReferences = [call, declaration];
+    const expectedReferences = [call, declaration, dynamicCall];
 
     // VS Code commonly sends the position immediately after the identifier,
     // so cover both the declaration and call-site token boundaries.
@@ -248,9 +261,16 @@ Midautumn26Entrance.prototype.showPopup = function () {};
     const incoming = plugin.provideCallHierarchyIncomingCalls(
         fileName, declaration + memberLength
     );
-    assert.equal(incoming.length, 1);
-    assert.equal(incoming[0].from.name, "_onButtonClicked");
-    assert.deepEqual(incoming[0].fromSpans.map((span) => span.start), [call]);
+    assert.deepEqual(
+        incoming.map((entry) => entry.from.name).sort(),
+        ["_onButtonClicked", "invokeDynamic"]
+    );
+    assert.deepEqual(
+        incoming.flatMap((entry) => entry.fromSpans.map((span) => span.start)).sort((a, b) => a - b),
+        [call, dynamicCall]
+    );
+    assert.ok(!expectedReferences.includes(configDeclaration));
+    assert.ok(!expectedReferences.includes(configCall));
 }
 
 console.log("regression tests passed");

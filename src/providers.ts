@@ -1,5 +1,6 @@
 import type * as tslib from "typescript/lib/tsserverlibrary";
 import {
+    classNameForFunction,
     expressionToName,
     findEnclosingExtendLiteral,
     findNodeAtPosition,
@@ -520,7 +521,10 @@ export function scanExpandoReferences(
 export function scanPrototypeReferences(
     ts: typeof tslib,
     ls: tslib.LanguageService,
+    getExtendIndex: GetExtendIndex,
     getProtoIndex: GetProtoIndex,
+    getExpandoIndex: GetExpandoIndex,
+    getIdentifierIndex: GetIdentifierIndex,
     className: string,
     memberName: string
 ): tslib.ReferenceEntry[] {
@@ -548,26 +552,144 @@ export function scanPrototypeReferences(
             if (
                 ts.isPropertyAccessExpression(node) &&
                 ts.isIdentifier(node.name) &&
-                node.name.text === memberName
+                prototypeAccessMatches(
+                    ts,
+                    node,
+                    getExtendIndex,
+                    getProtoIndex,
+                    getExpandoIndex,
+                    getIdentifierIndex,
+                    className,
+                    memberName
+                )
             ) {
-                const ownerClass = findPrototypeOwnerClass(ts, node);
-                const resolved = ownerClass
-                    ? lookupProtoMember(index, ownerClass, memberName)
-                    : undefined;
-                if (resolved?.className === className) {
-                    const start = node.name.getStart(sf);
-                    refs.push({
-                        fileName: sf.fileName,
-                        textSpan: { start, length: node.name.getEnd() - start },
-                        isWriteAccess: isWriteAccessOfPropertyAccess(ts, node.name),
-                    });
-                }
+                const start = node.name.getStart(sf);
+                refs.push({
+                    fileName: sf.fileName,
+                    textSpan: { start, length: node.name.getEnd() - start },
+                    isWriteAccess: isWriteAccessOfPropertyAccess(ts, node.name),
+                });
             }
             ts.forEachChild(node, visit);
         }
         visit(sf);
     }
     return dedupeReferences(refs);
+}
+
+/**
+ * Matches a prototype member access in legacy JS. Exact `this`/`self` and
+ * statically resolvable receivers stay class-safe. If a receiver remains
+ * `any` (for example `handler.handler` read from a Map), treat it as a
+ * duck-typed dispatch site. Explicit indexed objects such as
+ * `Midautumn26Config.checkShowRed` are known different symbols and excluded.
+ */
+function prototypeAccessMatches(
+    ts: typeof tslib,
+    access: tslib.PropertyAccessExpression,
+    getExtendIndex: GetExtendIndex,
+    getProtoIndex: GetProtoIndex,
+    getExpandoIndex: GetExpandoIndex,
+    getIdentifierIndex: GetIdentifierIndex,
+    className: string,
+    memberName: string
+): boolean {
+    if (!ts.isIdentifier(access.name) || access.name.text !== memberName) return false;
+
+    const index = getProtoIndex();
+    const thisOwner = prototypeThisOwner(ts, access);
+    if (thisOwner) {
+        return lookupProtoMember(index, thisOwner, memberName)?.className === className;
+    }
+
+    const receiverClass = resolveReceiverToClass(
+        ts,
+        getExtendIndex,
+        getProtoIndex,
+        access.expression,
+        getExpandoIndex,
+        getIdentifierIndex
+    );
+    if (receiverClass) {
+        return lookupProtoMember(index, receiverClass, memberName)?.className === className;
+    }
+
+    const fullName = expressionToName(ts, access);
+    if (fullName && getExpandoIndex().has(fullName)) return false;
+
+    // No indexed symbol or receiver type owns this access. In legacy cocos JS
+    // this is commonly an interface-style dispatch through Map/array data.
+    return true;
+}
+
+function prototypeThisOwner(
+    ts: typeof tslib,
+    access: tslib.PropertyAccessExpression
+): string | undefined {
+    const receiver = access.expression;
+    if (receiver.kind === ts.SyntaxKind.ThisKeyword) {
+        return findPrototypeOwnerClass(ts, access);
+    }
+    if (!ts.isIdentifier(receiver)) return undefined;
+
+    const owner = findPrototypeOwnerFunction(ts, access);
+    if (!owner || !hasThisAlias(ts, owner.fn, receiver.text, access.getStart())) {
+        return undefined;
+    }
+    return owner.className;
+}
+
+function findPrototypeOwnerFunction(
+    ts: typeof tslib,
+    start: tslib.Node
+): { className: string; fn: tslib.Node } | undefined {
+    let current: tslib.Node | undefined = start.parent;
+    while (current) {
+        if (
+            ts.isFunctionDeclaration(current) ||
+            ts.isFunctionExpression(current) ||
+            ts.isArrowFunction(current)
+        ) {
+            const className = classNameForFunction(ts, current);
+            if (className) return { className, fn: current };
+        }
+        current = current.parent;
+    }
+    return undefined;
+}
+
+function hasThisAlias(
+    ts: typeof tslib,
+    ownerFunction: tslib.Node,
+    alias: string,
+    beforePosition: number
+): boolean {
+    let found = false;
+    function visit(node: tslib.Node): void {
+        if (found || node.getStart() >= beforePosition) return;
+        if (
+            ts.isVariableDeclaration(node) &&
+            ts.isIdentifier(node.name) &&
+            node.name.text === alias &&
+            node.initializer?.kind === ts.SyntaxKind.ThisKeyword
+        ) {
+            found = true;
+            return;
+        }
+        if (
+            ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isIdentifier(node.left) &&
+            node.left.text === alias &&
+            node.right.kind === ts.SyntaxKind.ThisKeyword
+        ) {
+            found = true;
+            return;
+        }
+        ts.forEachChild(node, visit);
+    }
+    ts.forEachChild(ownerFunction, visit);
+    return found;
 }
 
 export function mergeReferences(
@@ -798,19 +920,23 @@ export function collectExpandoIncomingCalls(
 export function collectPrototypeIncomingCalls(
     ts: typeof tslib,
     ls: tslib.LanguageService,
+    getExtendIndex: GetExtendIndex,
     getProtoIndex: GetProtoIndex,
+    getExpandoIndex: GetExpandoIndex,
+    getIdentifierIndex: GetIdentifierIndex,
     className: string,
     memberName: string
 ): tslib.CallHierarchyIncomingCall[] {
-    const index = getProtoIndex();
-    return collectIncomingCalls(ts, ls, (access) => {
-        if (!ts.isIdentifier(access.name) || access.name.text !== memberName) return false;
-        const ownerClass = findPrototypeOwnerClass(ts, access);
-        const resolved = ownerClass
-            ? lookupProtoMember(index, ownerClass, memberName)
-            : undefined;
-        return resolved?.className === className;
-    });
+    return collectIncomingCalls(ts, ls, (access) => prototypeAccessMatches(
+        ts,
+        access,
+        getExtendIndex,
+        getProtoIndex,
+        getExpandoIndex,
+        getIdentifierIndex,
+        className,
+        memberName
+    ));
 }
 
 function collectIncomingCalls(

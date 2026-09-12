@@ -53,7 +53,7 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.1.16");
+        log("plugin loaded v0.1.17");
 
         // ─── Index cache ─────────────────────────────────────────────────────
         let cachedIndex: {
@@ -219,7 +219,10 @@ function init(modules: { typescript: typeof tslib }) {
                     const extra = scanPrototypeReferences(
                         ts,
                         ls,
+                        getExtendIndex,
                         getProtoIndex,
+                        getExpandoIndex,
+                        getIdentifierIndex,
                         protoCtx.fullName.substring(0, dot),
                         protoCtx.fullName.substring(dot + 1)
                     );
@@ -258,7 +261,10 @@ function init(modules: { typescript: typeof tslib }) {
                     const extra = scanPrototypeReferences(
                         ts,
                         ls,
+                        getExtendIndex,
                         getProtoIndex,
+                        getExpandoIndex,
+                        getIdentifierIndex,
                         protoCtx.fullName.substring(0, dot),
                         protoCtx.fullName.substring(dot + 1)
                     );
@@ -333,7 +339,10 @@ function init(modules: { typescript: typeof tslib }) {
                         return collectPrototypeIncomingCalls(
                             ts,
                             ls,
+                            getExtendIndex,
                             getProtoIndex,
+                            getExpandoIndex,
+                            getIdentifierIndex,
                             protoCtx.fullName.substring(0, dot),
                             protoCtx.fullName.substring(dot + 1)
                         );
