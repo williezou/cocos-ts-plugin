@@ -88,6 +88,21 @@ function collectEntries(
                 initializer: node.initializer,
                 sourceFile: sf,
             });
+
+            // `var Config = { value: ... }` can still be typed as `any` in
+            // legacy JS projects (for example because of an explicit JSDoc
+            // annotation or another declaration of Config). In that case
+            // tsserver loses both the property type and its definition site.
+            // Index the literal's members just like `Namespace.Config = {}`.
+            if (ts.isObjectLiteralExpression(node.initializer)) {
+                collectObjectLiteralMembers(
+                    ts,
+                    node.name.text,
+                    node.initializer,
+                    sf,
+                    expandoIndex
+                );
+            }
         }
         // `this.X = <value>` inside a constructor-bound function -> proto member
         if (
@@ -134,34 +149,47 @@ function collectEntries(
                         initializer: node.right,
                         sourceFile: sf,
                     });
-                    // a.b = { foo: function(){}, ... }  -> index each nested member.
-                    // Handles the cocos2d-x auto-api stub pattern in jsb_*_auto_api.js.
-                    if (ts.isObjectLiteralExpression(node.right)) {
-                        for (const prop of node.right.properties) {
-                            const propName = getPropertyName(ts, prop);
-                            const propNameNode = (prop as any).name as tslib.Node | undefined;
-                            if (!propName || !propNameNode) continue;
-                            const init = ts.isPropertyAssignment(prop)
-                                ? prop.initializer
-                                : ts.isMethodDeclaration(prop)
-                                ? (prop as unknown as tslib.Expression)
-                                : undefined;
-                            if (!init) continue;
-                            const nestedKey = `${lhsName}.${propName}`;
-                            addToIndex(expandoIndex, nestedKey, {
-                                fullName: nestedKey,
-                                nameNode: propNameNode,
-                                initializer: init,
-                                sourceFile: sf,
-                            });
-                        }
-                    }
+                }
+
+                // `a.b = { foo: ... }` and `Config = { foo: ... }` -> index
+                // each member. The latter is common when a global config is
+                // declared first and populated later.
+                if (ts.isObjectLiteralExpression(node.right)) {
+                    collectObjectLiteralMembers(ts, lhsName, node.right, sf, expandoIndex);
                 }
             }
         }
         ts.forEachChild(node, visit);
     }
     visit(sf);
+}
+
+/** Flattens the direct members of an object literal into the expando index. */
+function collectObjectLiteralMembers(
+    ts: typeof tslib,
+    ownerName: string,
+    literal: tslib.ObjectLiteralExpression,
+    sf: tslib.SourceFile,
+    expandoIndex: ExpandoIndex
+): void {
+    for (const prop of literal.properties) {
+        const propName = getPropertyName(ts, prop);
+        const propNameNode = (prop as any).name as tslib.Node | undefined;
+        if (!propName || !propNameNode) continue;
+        const init = ts.isPropertyAssignment(prop)
+            ? prop.initializer
+            : ts.isMethodDeclaration(prop)
+            ? (prop as unknown as tslib.Expression)
+            : undefined;
+        if (!init) continue;
+        const fullName = `${ownerName}.${propName}`;
+        addToIndex(expandoIndex, fullName, {
+            fullName,
+            nameNode: propNameNode,
+            initializer: init,
+            sourceFile: sf,
+        });
+    }
 }
 
 /**
