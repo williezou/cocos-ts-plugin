@@ -218,6 +218,104 @@ export function locateDottedAccess(
 }
 
 /**
+ * Resolves either side of an expando-style member reference:
+ *   - a use such as `Config.reset()`
+ *   - the `reset` declaration inside `Config = { reset: function () {} }`
+ *
+ * The reverse lookup for declarations is intentionally limited to dotted
+ * entries, excluding the synthetic entry for the root object itself.
+ */
+export function locateExpandoMember(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getIndex: GetExpandoIndex,
+    fileName: string,
+    position: number
+): DottedAccessHit | undefined {
+    const use = locateDottedAccess(ts, ls, getIndex, fileName, position);
+    if (use?.fullName.includes(".") && !use.fullName.includes(".prototype.")) return use;
+
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    for (const [fullName, entries] of getIndex()) {
+        if (!fullName.includes(".") || fullName.includes(".prototype.")) continue;
+        for (const entry of entries) {
+            if (entry.sourceFile === sourceFile && entry.nameNode === node) {
+                return { sourceFile, identifier: node, fullName, entry };
+            }
+        }
+    }
+    return undefined;
+}
+
+/**
+ * Resolves a classical-prototype member from either its declaration or a use
+ * inside one of the class's methods. `findPrototypeOwnerClass` deliberately
+ * walks through nested callbacks, so aliases such as `self = this` work too.
+ */
+export function locatePrototypeMember(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getProtoIndex: GetProtoIndex,
+    fileName: string,
+    position: number
+): DottedAccessHit | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || !ts.isIdentifier(node)) return undefined;
+
+    const index = getProtoIndex();
+
+    // Declaration: `<Class>.prototype.<member> = ...` or a member in a
+    // `<Class>.prototype = { ... }` literal.
+    for (const entry of index.values()) {
+        for (const member of entry.members) {
+            if (member.sourceFile === sourceFile && member.nameNode === node) {
+                return protoMemberHit(sourceFile, node, member);
+            }
+        }
+    }
+
+    // Use from a class-owned function: `this.<member>` or `self.<member>` in a
+    // nested callback. Only accept names that resolve on that prototype chain.
+    const parent = node.parent;
+    if (!parent || !ts.isPropertyAccessExpression(parent) || parent.name !== node) {
+        return undefined;
+    }
+    const ownerClass = findPrototypeOwnerClass(ts, parent);
+    if (!ownerClass) return undefined;
+    const member = lookupProtoMember(index, ownerClass, node.text);
+    return member ? protoMemberHit(sourceFile, node, member) : undefined;
+}
+
+function protoMemberHit(
+    sourceFile: tslib.SourceFile,
+    identifier: tslib.Identifier,
+    member: PrototypeMember
+): DottedAccessHit {
+    const fullName = `${member.className}.${member.memberName}`;
+    return {
+        sourceFile,
+        identifier,
+        fullName,
+        entry: {
+            fullName,
+            nameNode: member.nameNode,
+            initializer: member.initializer,
+            sourceFile: member.sourceFile,
+        },
+    };
+}
+
+/**
  * Cursor is on a member name in an extend literal — either the `xxx` of
  * `this.xxx` access, or the `xxx:` property declaration itself. Used by
  * find-references to know we're inside an extend-style class.

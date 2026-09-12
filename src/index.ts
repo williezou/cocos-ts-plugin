@@ -3,6 +3,8 @@ import { buildIndices } from "./indexer";
 import {
     locateChainedMember,
     locateDottedAccess,
+    locateExpandoMember,
+    locatePrototypeMember,
     locateThisMember,
     locateThisProtoMember,
     resolveExtendMember,
@@ -15,8 +17,11 @@ import {
     collectMemberCompletions,
     dedupeReferences,
     isAnyQuickInfo,
+    mergeExpandoReferences,
     mergeReferences,
+    scanExpandoReferences,
     scanExtendReferences,
+    scanPrototypeReferences,
 } from "./providers";
 import type {
     ExpandoIndex,
@@ -42,7 +47,7 @@ function init(modules: { typescript: typeof tslib }) {
         const log = (msg: string) =>
             info.project.projectService.logger.info(`[cocos-ts-plugin] ${msg}`);
 
-        log("plugin loaded v0.1.14");
+        log("plugin loaded v0.1.15");
 
         // ─── Index cache ─────────────────────────────────────────────────────
         let cachedIndex: {
@@ -194,22 +199,75 @@ function init(modules: { typescript: typeof tslib }) {
             guard("findReferences", () => {
                 const original = ls.findReferences(fileName, position);
                 const memberCtx = resolveExtendMember(ts, ls, fileName, position);
-                if (!memberCtx) {
-                    log(`refs: no extend-member context at ${fileName}:${position}`);
-                    return original;
+                if (memberCtx) {
+                    const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+                    log(`refs: ${memberCtx.memberName} -> tsserver=${original?.reduce((n, s) => n + s.references.length, 0) ?? 0}, scanned=${extra.length}`);
+                    return mergeReferences(ts, original, extra, memberCtx);
                 }
-                const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
-                log(`refs: ${memberCtx.memberName} -> tsserver=${original?.reduce((n, s) => n + s.references.length, 0) ?? 0}, scanned=${extra.length}`);
-                return mergeReferences(ts, original, extra, memberCtx);
+
+                const protoCtx = locatePrototypeMember(
+                    ts, ls, getProtoIndex, fileName, position
+                );
+                if (protoCtx) {
+                    const dot = protoCtx.fullName.lastIndexOf(".");
+                    const extra = scanPrototypeReferences(
+                        ts,
+                        ls,
+                        getProtoIndex,
+                        protoCtx.fullName.substring(0, dot),
+                        protoCtx.fullName.substring(dot + 1)
+                    );
+                    log(`refs: ${protoCtx.fullName} -> tsserver=${original?.reduce((n, s) => n + s.references.length, 0) ?? 0}, scanned=${extra.length}`);
+                    return mergeExpandoReferences(ts, original, extra, protoCtx);
+                }
+
+                const expandoCtx = locateExpandoMember(
+                    ts, ls, getExpandoIndex, fileName, position
+                );
+                if (expandoCtx) {
+                    const extra = scanExpandoReferences(
+                        ts, ls, getExpandoIndex, expandoCtx.fullName
+                    );
+                    log(`refs: ${expandoCtx.fullName} -> tsserver=${original?.reduce((n, s) => n + s.references.length, 0) ?? 0}, scanned=${extra.length}`);
+                    return mergeExpandoReferences(ts, original, extra, expandoCtx);
+                }
+
+                log(`refs: no plugin member context at ${fileName}:${position}`);
+                return original;
             }, ls.findReferences(fileName, position));
 
         proxy.getReferencesAtPosition = (fileName, position) =>
             guard("getReferencesAtPosition", () => {
                 const original = ls.getReferencesAtPosition(fileName, position) ?? [];
                 const memberCtx = resolveExtendMember(ts, ls, fileName, position);
-                if (!memberCtx) return original.length ? original : undefined;
-                const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
-                return dedupeReferences([...original, ...extra]);
+                if (memberCtx) {
+                    const extra = scanExtendReferences(ts, ls, memberCtx.memberName);
+                    return dedupeReferences([...original, ...extra]);
+                }
+                const protoCtx = locatePrototypeMember(
+                    ts, ls, getProtoIndex, fileName, position
+                );
+                if (protoCtx) {
+                    const dot = protoCtx.fullName.lastIndexOf(".");
+                    const extra = scanPrototypeReferences(
+                        ts,
+                        ls,
+                        getProtoIndex,
+                        protoCtx.fullName.substring(0, dot),
+                        protoCtx.fullName.substring(dot + 1)
+                    );
+                    return dedupeReferences([...original, ...extra]);
+                }
+                const expandoCtx = locateExpandoMember(
+                    ts, ls, getExpandoIndex, fileName, position
+                );
+                if (expandoCtx) {
+                    const extra = scanExpandoReferences(
+                        ts, ls, getExpandoIndex, expandoCtx.fullName
+                    );
+                    return dedupeReferences([...original, ...extra]);
+                }
+                return original.length ? original : undefined;
             }, ls.getReferencesAtPosition(fileName, position));
 
         proxy.getCompletionsAtPosition = (fileName, position, options, formatOptions) =>

@@ -121,4 +121,66 @@ enumSeasonNodeType.pointsRewards;
     assert.match(hover, /pointsRewards/);
 }
 
+{
+    const source = `
+Midautumn26Config = {
+    resetMainBtnSpine: function (active) {},
+};
+Midautumn26Config.resetMainBtnSpine(true);
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const memberName = "resetMainBtnSpine";
+    const declarationStart = source.indexOf(memberName);
+    const callStart = source.lastIndexOf(memberName);
+
+    for (const queryStart of [declarationStart, callStart]) {
+        const references = plugin.getReferencesAtPosition(fileName, queryStart + 1) ?? [];
+        assert.deepEqual(
+            references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            [declarationStart, callStart]
+        );
+
+        const symbols = plugin.findReferences(fileName, queryStart + 1);
+        assert.ok(symbols && symbols.length > 0);
+        assert.deepEqual(
+            symbols[0].references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            [declarationStart, callStart]
+        );
+    }
+}
+
+{
+    const source = `
+let Midautumn26Entrance = function () {};
+Midautumn26Entrance.prototype.createBtn = function () {
+    this._updateEndingTip();
+    let self = this;
+    schedule(function () {
+        self._updateEndingTip();
+    });
+};
+Midautumn26Entrance.prototype._updateEndingTip = function () {};
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const memberName = "_updateEndingTip";
+    const firstCall = source.indexOf(memberName);
+    const secondCall = source.indexOf(memberName, firstCall + memberName.length);
+    const declaration = source.lastIndexOf(memberName);
+    const expected = [firstCall, secondCall, declaration].sort((a, b) => a - b);
+
+    for (const queryStart of expected) {
+        const references = plugin.getReferencesAtPosition(fileName, queryStart + 1) ?? [];
+        assert.deepEqual(
+            references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            expected
+        );
+        const symbols = plugin.findReferences(fileName, queryStart + 1);
+        assert.ok(symbols && symbols.length > 0);
+        assert.deepEqual(
+            symbols[0].references.map((ref) => ref.textSpan.start).sort((a, b) => a - b),
+            expected
+        );
+    }
+}
+
 console.log("regression tests passed");

@@ -10,7 +10,12 @@ import {
     walkExtendLiterals,
     walkThisAccesses,
 } from "./ast";
-import { extractClassFromInitializer, lookupClassName, resolveReceiverToClass } from "./resolver";
+import {
+    extractClassFromInitializer,
+    lookupClassName,
+    lookupProtoMember,
+    resolveReceiverToClass,
+} from "./resolver";
 import type {
     DottedAccessHit,
     ExtendIndex,
@@ -464,6 +469,107 @@ export function scanExtendReferences(
     return refs;
 }
 
+/**
+ * Finds declarations and uses of one exact expando/object-literal member.
+ * Matching the complete dotted name keeps unrelated methods with the same
+ * trailing name out of the result.
+ */
+export function scanExpandoReferences(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getExpandoIndex: GetExpandoIndex,
+    fullName: string
+): tslib.ReferenceEntry[] {
+    const program = ls.getProgram();
+    if (!program) return [];
+
+    const refs: tslib.ReferenceEntry[] = [];
+    const definitions = getExpandoIndex().get(fullName) ?? [];
+    for (const entry of definitions) {
+        const start = entry.nameNode.getStart(entry.sourceFile);
+        refs.push({
+            fileName: entry.sourceFile.fileName,
+            textSpan: { start, length: entry.nameNode.getEnd() - start },
+            isWriteAccess: true,
+        });
+    }
+
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        function visit(node: tslib.Node): void {
+            if (
+                ts.isPropertyAccessExpression(node) &&
+                ts.isIdentifier(node.name) &&
+                expressionToName(ts, node) === fullName
+            ) {
+                const start = node.name.getStart(sf);
+                refs.push({
+                    fileName: sf.fileName,
+                    textSpan: { start, length: node.name.getEnd() - start },
+                    isWriteAccess: isWriteAccessOfPropertyAccess(ts, node.name),
+                });
+            }
+            ts.forEachChild(node, visit);
+        }
+        visit(sf);
+    }
+    return dedupeReferences(refs);
+}
+
+/** Finds one prototype member's declaration and calls through its class chain. */
+export function scanPrototypeReferences(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    getProtoIndex: GetProtoIndex,
+    className: string,
+    memberName: string
+): tslib.ReferenceEntry[] {
+    const program = ls.getProgram();
+    if (!program) return [];
+    const index = getProtoIndex();
+    const refs: tslib.ReferenceEntry[] = [];
+
+    const entry = index.get(className);
+    if (entry) {
+        for (const member of entry.members) {
+            if (member.memberName !== memberName) continue;
+            const start = member.nameNode.getStart(member.sourceFile);
+            refs.push({
+                fileName: member.sourceFile.fileName,
+                textSpan: { start, length: member.nameNode.getEnd() - start },
+                isWriteAccess: true,
+            });
+        }
+    }
+
+    for (const sf of program.getSourceFiles()) {
+        if (sf.isDeclarationFile) continue;
+        function visit(node: tslib.Node): void {
+            if (
+                ts.isPropertyAccessExpression(node) &&
+                ts.isIdentifier(node.name) &&
+                node.name.text === memberName
+            ) {
+                const ownerClass = findPrototypeOwnerClass(ts, node);
+                const resolved = ownerClass
+                    ? lookupProtoMember(index, ownerClass, memberName)
+                    : undefined;
+                if (resolved?.className === className) {
+                    const start = node.name.getStart(sf);
+                    refs.push({
+                        fileName: sf.fileName,
+                        textSpan: { start, length: node.name.getEnd() - start },
+                        isWriteAccess: isWriteAccessOfPropertyAccess(ts, node.name),
+                    });
+                }
+            }
+            ts.forEachChild(node, visit);
+        }
+        visit(sf);
+    }
+    return dedupeReferences(refs);
+}
+
 export function mergeReferences(
     ts: typeof tslib,
     original: tslib.ReferencedSymbol[] | undefined,
@@ -508,6 +614,35 @@ export function mergeReferences(
           };
 
     return [{ definition, references: collected }];
+}
+
+export function mergeExpandoReferences(
+    ts: typeof tslib,
+    original: tslib.ReferencedSymbol[] | undefined,
+    extra: tslib.ReferenceEntry[],
+    ctx: DottedAccessHit
+): tslib.ReferencedSymbol[] | undefined {
+    const combined: tslib.ReferenceEntry[] = [];
+    if (original) {
+        for (const symbol of original) combined.push(...symbol.references);
+    }
+    combined.push(...extra);
+    const refs = dedupeReferences(combined);
+    if (refs.length === 0) return original;
+
+    const nameNode = ctx.entry.nameNode;
+    const sf = ctx.entry.sourceFile;
+    const start = nameNode.getStart(sf);
+    const definition: tslib.ReferencedSymbolDefinitionInfo = original?.[0]?.definition ?? {
+        containerKind: ts.ScriptElementKind.classElement,
+        containerName: ctx.fullName.substring(0, ctx.fullName.lastIndexOf(".")),
+        fileName: sf.fileName,
+        kind: ts.ScriptElementKind.memberVariableElement,
+        name: ctx.fullName,
+        textSpan: { start, length: nameNode.getEnd() - start },
+        displayParts: [{ text: ctx.fullName, kind: "propertyName" }],
+    };
+    return [{ definition, references: refs }];
 }
 
 export function dedupeReferences(refs: tslib.ReferenceEntry[]): tslib.ReferenceEntry[] {
