@@ -67,4 +67,33 @@ Midautumn26Config.entranceEndingSecs = 3;
 Midautumn26Config.entranceEndingSecs;
 `);
 
+// Legacy globals are often guarded so evaluating the file twice preserves an
+// existing value. This is the pattern used by sohoojs/configMidautumn26.js.
+assertConfigMemberResolves(`
+let Midautumn26Config = Midautumn26Config || {
+    entranceEndingSecs: 3,
+};
+Midautumn26Config.entranceEndingSecs;
+`);
+
+{
+    const source = `
+let Midautumn26Config = Midautumn26Config || {
+    bundle: {
+        bundleNames: {
+            poster: "poster_bundle",
+        },
+    },
+};
+Midautumn26Config.bundle.bundleNames.poster;
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const propertyName = "poster";
+    const usageStart = source.lastIndexOf(propertyName);
+    const definition = plugin.getDefinitionAndBoundSpan(fileName, usageStart + 1);
+    assert.ok(definition && definition.definitions && definition.definitions.length > 0);
+    const target = definition.definitions[0].textSpan;
+    assert.equal(source.slice(target.start, target.start + target.length), propertyName);
+}
+
 console.log("regression tests passed");

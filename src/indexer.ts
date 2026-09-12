@@ -94,15 +94,13 @@ function collectEntries(
             // annotation or another declaration of Config). In that case
             // tsserver loses both the property type and its definition site.
             // Index the literal's members just like `Namespace.Config = {}`.
-            if (ts.isObjectLiteralExpression(node.initializer)) {
-                collectObjectLiteralMembers(
-                    ts,
-                    node.name.text,
-                    node.initializer,
-                    sf,
-                    expandoIndex
-                );
-            }
+            collectObjectLiteralInitializers(
+                ts,
+                node.name.text,
+                node.initializer,
+                sf,
+                expandoIndex
+            );
         }
         // `this.X = <value>` inside a constructor-bound function -> proto member
         if (
@@ -154,14 +152,55 @@ function collectEntries(
                 // `a.b = { foo: ... }` and `Config = { foo: ... }` -> index
                 // each member. The latter is common when a global config is
                 // declared first and populated later.
-                if (ts.isObjectLiteralExpression(node.right)) {
-                    collectObjectLiteralMembers(ts, lhsName, node.right, sf, expandoIndex);
-                }
+                collectObjectLiteralInitializers(ts, lhsName, node.right, sf, expandoIndex);
             }
         }
         ts.forEachChild(node, visit);
     }
     visit(sf);
+}
+
+/**
+ * Finds object-literal alternatives used to initialize a legacy global.
+ * Besides a direct `{ ... }`, cocos projects commonly use the idempotent form
+ * `let Config = Config || { ... }` so the file can safely be evaluated twice.
+ */
+function collectObjectLiteralInitializers(
+    ts: typeof tslib,
+    ownerName: string,
+    initializer: tslib.Expression,
+    sf: tslib.SourceFile,
+    expandoIndex: ExpandoIndex
+): void {
+    if (ts.isParenthesizedExpression(initializer)) {
+        collectObjectLiteralInitializers(
+            ts,
+            ownerName,
+            initializer.expression,
+            sf,
+            expandoIndex
+        );
+        return;
+    }
+    if (ts.isObjectLiteralExpression(initializer)) {
+        collectObjectLiteralMembers(ts, ownerName, initializer, sf, expandoIndex);
+        return;
+    }
+    if (ts.isBinaryExpression(initializer)) {
+        const op = initializer.operatorToken.kind;
+        if (
+            op === ts.SyntaxKind.BarBarToken ||
+            op === ts.SyntaxKind.QuestionQuestionToken
+        ) {
+            collectObjectLiteralInitializers(ts, ownerName, initializer.left, sf, expandoIndex);
+            collectObjectLiteralInitializers(ts, ownerName, initializer.right, sf, expandoIndex);
+        }
+        return;
+    }
+    if (ts.isConditionalExpression(initializer)) {
+        collectObjectLiteralInitializers(ts, ownerName, initializer.whenTrue, sf, expandoIndex);
+        collectObjectLiteralInitializers(ts, ownerName, initializer.whenFalse, sf, expandoIndex);
+    }
 }
 
 /** Flattens the direct members of an object literal into the expando index. */
@@ -189,6 +228,9 @@ function collectObjectLiteralMembers(
             initializer: init,
             sourceFile: sf,
         });
+        // Flatten nested config objects too, so chains such as
+        // `Config.bundle.bundleNames.poster` can resolve every segment.
+        collectObjectLiteralInitializers(ts, fullName, init, sf, expandoIndex);
     }
 }
 
