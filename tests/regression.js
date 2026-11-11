@@ -78,6 +78,35 @@ Midautumn26Config.entranceEndingSecs;
 
 {
     const source = `
+let FishingAtlasPage = FishingPopup.extend({
+    _claim: function () {
+        let self = this;
+        fishingMgr.doClaimAtlas(function () {
+            self._refresh();
+        });
+    },
+    _refresh: function () {},
+});
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const memberName = "_refresh";
+    const usageStart = source.indexOf(`self.${memberName}`) + "self.".length;
+    const declarationStart = source.lastIndexOf(memberName);
+
+    const definition = plugin.getDefinitionAndBoundSpan(fileName, usageStart + 1);
+    assert.ok(definition && definition.definitions && definition.definitions.length > 0);
+    assert.equal(definition.definitions[0].textSpan.start, declarationStart);
+
+    const quickInfo = plugin.getQuickInfoAtPosition(fileName, usageStart + 1);
+    const hover = quickInfo && quickInfo.displayParts
+        ? quickInfo.displayParts.map((part) => part.text).join("")
+        : "";
+    assert.match(hover, /^\(method\) _refresh:/);
+    assert.doesNotMatch(hover, /any/);
+}
+
+{
+    const source = `
 let Midautumn26Config = Midautumn26Config || {
     bundle: {
         bundleNames: {

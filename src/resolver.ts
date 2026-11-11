@@ -54,15 +54,114 @@ export function locateThisMember(
     const parent = node.parent;
     if (!parent || !ts.isPropertyAccessExpression(parent)) return undefined;
     if (parent.name !== node) return undefined;
-    if (parent.expression.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
-
     const literal = findEnclosingExtendLiteral(ts, parent);
     if (!literal) return undefined;
+    if (!isExtendThisReceiver(ts, parent.expression, parent, literal)) return undefined;
 
     const memberName = node.text;
     const hit = lookupInLiteralAndChain(ts, getIndex, literal, memberName, getExpandoIndex);
     if (!hit) return undefined;
     return makeContext(sourceFile, node, memberName, hit);
+}
+
+/**
+ * Accepts both a direct `this.member` access and the legacy cocos pattern
+ * `let self = this; ... self.member` used from a nested callback.  The alias
+ * must belong to the same extend-literal method; a same-named variable in a
+ * nested function shadows an outer alias.
+ */
+function isExtendThisReceiver(
+    ts: typeof tslib,
+    receiver: tslib.Expression,
+    access: tslib.PropertyAccessExpression,
+    literal: tslib.ObjectLiteralExpression
+): boolean {
+    if (receiver.kind === ts.SyntaxKind.ThisKeyword) return true;
+    if (!ts.isIdentifier(receiver)) return false;
+
+    const alias = receiver.text;
+    const accessStart = access.getStart();
+    let current: tslib.Node | undefined = access.parent;
+
+    while (current && current !== literal) {
+        if (
+            ts.isFunctionDeclaration(current) ||
+            ts.isFunctionExpression(current) ||
+            ts.isArrowFunction(current) ||
+            ts.isMethodDeclaration(current)
+        ) {
+            const binding = findAliasBindingInFunction(ts, current, alias, accessStart);
+            if (binding !== undefined) return binding;
+
+            if (isExtendMemberFunction(ts, current, literal)) return false;
+        }
+        current = current.parent;
+    }
+    return false;
+}
+
+function isExtendMemberFunction(
+    ts: typeof tslib,
+    fn: tslib.FunctionDeclaration | tslib.FunctionExpression | tslib.ArrowFunction | tslib.MethodDeclaration,
+    literal: tslib.ObjectLiteralExpression
+): boolean {
+    if (ts.isMethodDeclaration(fn)) return fn.parent === literal;
+    return !!(
+        fn.parent &&
+        ts.isPropertyAssignment(fn.parent) &&
+        fn.parent.initializer === fn &&
+        fn.parent.parent === literal
+    );
+}
+
+/** Returns true for `<alias> = this`, false for a shadowing binding, and
+ * undefined when this function scope has no binding for the alias. */
+function findAliasBindingInFunction(
+    ts: typeof tslib,
+    fn: tslib.FunctionDeclaration | tslib.FunctionExpression | tslib.ArrowFunction | tslib.MethodDeclaration,
+    alias: string,
+    beforePosition: number
+): boolean | undefined {
+    for (const parameter of fn.parameters) {
+        if (ts.isIdentifier(parameter.name) && parameter.name.text === alias) return false;
+    }
+
+    let latestStart = -1;
+    let latestIsThis: boolean | undefined;
+    const visit = (node: tslib.Node): void => {
+        if (node !== fn && (
+            ts.isFunctionDeclaration(node) ||
+            ts.isFunctionExpression(node) ||
+            ts.isArrowFunction(node) ||
+            ts.isMethodDeclaration(node)
+        )) {
+            return;
+        }
+        const start = node.getStart();
+        if (start >= beforePosition) return;
+
+        if (
+            ts.isVariableDeclaration(node) &&
+            ts.isIdentifier(node.name) &&
+            node.name.text === alias &&
+            start > latestStart
+        ) {
+            latestStart = start;
+            latestIsThis = node.initializer?.kind === ts.SyntaxKind.ThisKeyword;
+        } else if (
+            ts.isBinaryExpression(node) &&
+            node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isIdentifier(node.left) &&
+            node.left.text === alias &&
+            start > latestStart
+        ) {
+            latestStart = start;
+            latestIsThis = node.right.kind === ts.SyntaxKind.ThisKeyword;
+        }
+        ts.forEachChild(node, visit);
+    };
+    if (fn.body) visit(fn.body);
+    return latestIsThis;
 }
 
 /**
