@@ -1,0 +1,24 @@
+name: Publish
+
+# 手动触发：先确认 package.json version 是 registry 上没有的新版本。
+# 认证走 npm Trusted Publishing（OIDC），不配置任何 token。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # npm >= 10.9 才有内置的 OIDC publish 支持
+          node-version: 22
+          registry-url: https://registry.npmjs.org/
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --provenance --access public
