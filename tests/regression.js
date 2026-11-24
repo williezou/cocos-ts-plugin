@@ -302,4 +302,67 @@ function invokeDynamic(handler) {
     assert.ok(!expectedReferences.includes(configCall));
 }
 
+// Multi-segment receiver chains assigned through constructor-body fields:
+// `this._exchangeRuleInfos = cityV2Mgr.baseDataInfo.exchangeRuleInfo` must walk
+// each segment (identifier -> extend ctor field -> proto field) and land the
+// final call on the prototype-chain member definition.
+{
+    const source = `
+let ExchangeRulesInfo = function () {
+    this.doExchange = function (ruleId, callback) {};
+};
+let TycoonCoinExchangeRuleInfo = function () {
+    ExchangeRulesInfo.call(this);
+};
+TycoonCoinExchangeRuleInfo.prototype = Object.create(ExchangeRulesInfo.prototype);
+TycoonCoinExchangeRuleInfo.prototype.constructor = TycoonCoinExchangeRuleInfo;
+let DataCityV2Base = function () {
+    this.exchangeRuleInfo = new TycoonCoinExchangeRuleInfo();
+};
+let _CityV2Manager = cc.Class.extend({
+    ctor: function () {
+        this.baseDataInfo = new DataCityV2Base();
+    },
+});
+let cityV2Mgr = cityV2Mgr || new _CityV2Manager();
+let PopupCityV2Store = cc.Node.extend({
+    _exchangeRuleInfos: null,
+    goingEnter: function () {
+        this._exchangeRuleInfos = cityV2Mgr.baseDataInfo.exchangeRuleInfo;
+    },
+    _doPurchase: function (ruleId) {
+        this._exchangeRuleInfos.doExchange(ruleId, function () {});
+    },
+});
+`;
+    const { fileName, plugin } = createLanguageService(source);
+    const usageStart = source.lastIndexOf("this._exchangeRuleInfos.doExchange") + "this._exchangeRuleInfos.".length;
+    const definition = plugin.getDefinitionAndBoundSpan(fileName, usageStart + 3);
+    assert.ok(definition && definition.definitions && definition.definitions.length > 0,
+        "chained `this._field = a.b.c` receiver must resolve across segments");
+    const target = definition.definitions[0].textSpan;
+    assert.equal(source.slice(target.start, target.start + target.length), "doExchange");
+    assert.ok(target.start < source.indexOf("PopupCityV2Store"),
+        "definition must land on ExchangeRulesInfo, not the usage site");
+
+    // Hover on the receiver at the call site: the checker only knows the
+    // literal's `null` initial value there; the plugin must fill in the
+    // assigned class from the `this._exchangeRuleInfos = ...` statement.
+    const receiverName = source.lastIndexOf("this._exchangeRuleInfos.doExchange") + "this.".length;
+    const hover = plugin.getQuickInfoAtPosition(fileName, receiverName + 3);
+    const hoverText = hover && hover.displayParts
+        ? hover.displayParts.map((part) => part.text).join("")
+        : "";
+    assert.equal(hoverText, "(property) _exchangeRuleInfos: TycoonCoinExchangeRuleInfo");
+
+    // Hover on the `this` keyword: tsserver types it `any` (no declaration for
+    // cc.Node.extend); by convention the plugin reports the extend base class.
+    const thisStart = source.lastIndexOf("this._exchangeRuleInfos.doExchange");
+    const thisQi = plugin.getQuickInfoAtPosition(fileName, thisStart + 2);
+    const thisText = thisQi && thisQi.displayParts
+        ? thisQi.displayParts.map((part) => part.text).join("")
+        : "";
+    assert.equal(thisText, "(local var) this: cc.Node");
+}
+
 console.log("regression tests passed");

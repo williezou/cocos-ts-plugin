@@ -14,6 +14,7 @@ import {
     buildDefinition,
     buildDefinitionFromExpando,
     buildQuickInfo,
+    buildQuickInfoForThis,
     buildQuickInfoFromExpando,
     collectMemberCompletions,
     collectExpandoImplementations,
@@ -21,7 +22,7 @@ import {
     collectPrototypeImplementations,
     collectPrototypeIncomingCalls,
     dedupeReferences,
-    isAnyQuickInfo,
+    isWeakQuickInfo,
     mergeExpandoReferences,
     mergeImplementations,
     mergeReferences,
@@ -177,7 +178,7 @@ function init(modules: { typescript: typeof tslib }) {
         proxy.getQuickInfoAtPosition = (fileName, position) =>
             guard("getQuickInfoAtPosition", () => {
                 const original = ls.getQuickInfoAtPosition(fileName, position);
-                if (original && !isAnyQuickInfo(ts, original)) return original;
+                if (original && !isWeakQuickInfo(ts, original)) return original;
 
                 const ctx =
                     locateThisMember(ts, ls, getExtendIndex, getExpandoIndex, fileName, position) ??
@@ -186,17 +187,22 @@ function init(modules: { typescript: typeof tslib }) {
                     );
                 if (ctx) {
                     log(`hover: resolving ${ctx.memberName}`);
-                    return buildQuickInfo(ts, ls, ctx, getExtendIndex, getProtoIndex) ?? original;
+                    return buildQuickInfo(ts, ls, ctx, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex) ?? original;
                 }
                 const proto = locateThisProtoMember(ts, ls, getProtoIndex, fileName, position);
                 if (proto) {
                     log(`hover: resolving ${proto.fullName}`);
-                    return buildQuickInfoFromExpando(ts, ls, proto, getExtendIndex, getProtoIndex) ?? original;
+                    return buildQuickInfoFromExpando(ts, ls, proto, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex) ?? original;
                 }
                 const dotted = locateDottedAccess(ts, ls, getExpandoIndex, fileName, position);
                 if (dotted) {
                     log(`hover: resolving ${dotted.fullName}`);
-                    return buildQuickInfoFromExpando(ts, ls, dotted, getExtendIndex, getProtoIndex) ?? original;
+                    return buildQuickInfoFromExpando(ts, ls, dotted, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex) ?? original;
+                }
+                const thisQi = buildQuickInfoForThis(ts, ls, fileName, position);
+                if (thisQi) {
+                    log("hover: resolving this keyword in extend literal");
+                    return thisQi;
                 }
                 return original;
             }, ls.getQuickInfoAtPosition(fileName, position));

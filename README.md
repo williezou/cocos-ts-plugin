@@ -28,10 +28,11 @@ This plugin sidesteps the whole type-inference problem by hooking the Language S
     - dotted-namespace static accesses like `sp.SkeletonAnimation.createWithJsonFile` or `ccui.Widget.TOUCH_ENDED`, by indexing top-level `a.b.c = ...` assignments. Object-literal RHS values are flattened too, so `cc.Node = { addChild: function(){...} }` style auto-binding stubs work.
     - chained accesses like `this.m_layout.setBackGroundColor(...)` when `m_layout: ccui.Layout` (or `ccui.layout` with the project's lowercase type-hint convention) appears as a property in the extend literal. The receiver's class is inferred from the field's initializer and walked through its own extend chain.
     - `this.xxx` inside classical-prototype methods (`Foo.prototype.bar = function () { this.xxx /* here */ }`). The plugin indexes `<Class>.prototype.<m> = ...` member assignments and `<Class>.prototype = <Other>.prototype | new Other() | Object.create(Other.prototype)` parent links, then walks the chain.
-- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, using the same resolution paths as definition.
+    - multi-segment receiver chains assigned through fields, e.g. `this._rules = cityV2Mgr.baseDataInfo.exchangeRuleInfo; this._rules.doExchange(...)` — each RHS segment is resolved in turn (top-level `let mgr = new Cls()` identifier, then the class's ctor/proto field, then that field's own initializer).
+- **Hover**: shows `(method) xxx: (n: any) => number` or `(property) xxx: 0` with JSDoc, using the same resolution paths as definition. When the checker only sees a field's `null` initial value (declared `_field: null`, typed by a later `this._field = <RHS>`), the type is recovered from that assignment. Hovering the `this` keyword inside an `X.extend({...})` literal shows `(local var) this: <Base>`.
 - **Find All References**: from either a `xxx:` declaration or a `this.xxx` call site, lists all matching property declarations and `this.xxx` accesses inside `*.extend({...})` literals across the project
 
-All three augment tsserver's native answers only when those are empty/`any`-typed, so normal IntelliSense for non-cocos code is untouched.
+All three augment tsserver's native answers only when those are empty, `any`-typed, or a bare `null`/`undefined` initial value, so normal IntelliSense for non-cocos code is untouched.
 
 ### Current limitations
 
@@ -93,7 +94,7 @@ The plugin proxies three Language Service methods:
 |---|---|
 | `getDefinitionAndBoundSpan` | If tsserver returns no definitions, parse the source, locate the enclosing `<X>.extend({...})` literal, and return the matching `xxx:` property as the definition. Walks the cached extend index up the parent chain on miss. Falls back to a cached expando index (`a.b.c = …` assignments) for dotted-namespace lookups. |
 | `getDefinitionAtPosition` | Same. |
-| `getQuickInfoAtPosition` | If tsserver returns `any` or nothing, build hover info from the property's value (function signature for `function(){}` initializers, inferred type otherwise) and emit its JSDoc. Walks the parent chain and expando index in the same way. |
+| `getQuickInfoAtPosition` | If tsserver returns `any`, `null`/`undefined`, or nothing, build hover info from the property's value (function signature for `function(){}` initializers, inferred type otherwise), falling back to `this.<field> = <RHS>` assignments in the proto index for `null`-initialized fields, and emit its JSDoc. Walks the parent chain and expando index in the same way. Inside extend literals, hovering the bare `this` keyword reports the extend base class. |
 | `findReferences` / `getReferencesAtPosition` | Scan every source file's `<X>.extend({...})` literals and collect (a) properties named `xxx`, (b) `this.xxx` accesses inside such literals. Merged with and deduplicated against tsserver's native results. |
 | `getCompletionsAtPosition` | After a `.`, enumerate members from the relevant index (current extend literal + parent chain for `this.`; resolved class for `this.<field>.` via type-hint convention; matching expando keys for dotted namespaces). Merged with tsserver's native results — when a name collides with a tsserver "warning" (low-confidence) entry, ours replaces it. |
 

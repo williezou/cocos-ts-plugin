@@ -12,6 +12,7 @@ import {
     walkThisAccesses,
 } from "./ast";
 import {
+    collectProtoMembers,
     extractClassFromInitializer,
     lookupClassName,
     lookupProtoMember,
@@ -61,7 +62,9 @@ export function buildQuickInfo(
     ls: tslib.LanguageService,
     ctx: ThisMemberContext,
     getExtendIndex: GetExtendIndex,
-    getProtoIndex: GetProtoIndex
+    getProtoIndex: GetProtoIndex,
+    getExpandoIndex?: GetExpandoIndex,
+    getIdentifierIndex?: GetIdentifierIndex
 ): tslib.QuickInfo | undefined {
     const program = ls.getProgram();
     if (!program) return undefined;
@@ -90,7 +93,18 @@ export function buildQuickInfo(
         } else {
             // cocos 约定: `m_field: <ClassName>` 把字段类型注释为 <ClassName>。
             // 先按约定解析；解析不出来才落回 TS checker（无注解、字面量等）。
-            const className = extractClassFromInitializer(ts, valueNode, getExtendIndex, getProtoIndex);
+            let className = extractClassFromInitializer(ts, valueNode, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
+            if (!className) {
+                // 声明处写 `_field: null`、类型线索来自方法内 `this._field = <RHS>`
+                // 时，checker 在后续使用点只会给出 `null`；用 proto 索引的赋值 RHS 补回。
+                const ownerClass = findPrototypeOwnerClass(ts, identifier);
+                if (ownerClass) {
+                    for (const m of collectProtoMembers(getProtoIndex(), ownerClass, memberName)) {
+                        className = extractClassFromInitializer(ts, m.initializer, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
+                        if (className) break;
+                    }
+                }
+            }
             if (className) {
                 typeStr = className;
             } else {
@@ -147,7 +161,9 @@ export function buildQuickInfoFromExpando(
     ls: tslib.LanguageService,
     hit: DottedAccessHit,
     getExtendIndex: GetExtendIndex,
-    getProtoIndex: GetProtoIndex
+    getProtoIndex: GetProtoIndex,
+    getExpandoIndex?: GetExpandoIndex,
+    getIdentifierIndex?: GetIdentifierIndex
 ): tslib.QuickInfo | undefined {
     const program = ls.getProgram();
     if (!program) return undefined;
@@ -172,7 +188,7 @@ export function buildQuickInfoFromExpando(
     } else {
         // cocos 约定：`a.b.c = <Class>` 把成员类型注释为 <Class>。
         // 先按约定解析；解析不出来才落回 TS checker。
-        const className = extractClassFromInitializer(ts, init, getExtendIndex, getProtoIndex);
+        const className = extractClassFromInitializer(ts, init, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
         if (className) {
             typeStr = className;
         } else {
@@ -200,6 +216,57 @@ export function isAnyQuickInfo(ts: typeof tslib, qi: tslib.QuickInfo): boolean {
     if (!qi.displayParts) return false;
     const text = qi.displayParts.map((p) => p.text).join("");
     return /:\s*any\s*$/.test(text) || text === "any";
+}
+
+/**
+ * Hover on the `this` keyword inside a cocos `<Base>.extend({...})` literal.
+ * tsserver types it `any` because `cc.Node.extend` has no declaration; by
+ * cocos convention `this` is the instance the extend call constructs, so the
+ * base name is the best available answer.
+ */
+export function buildQuickInfoForThis(
+    ts: typeof tslib,
+    ls: tslib.LanguageService,
+    fileName: string,
+    position: number
+): tslib.QuickInfo | undefined {
+    const program = ls.getProgram();
+    if (!program) return undefined;
+    const sourceFile = program.getSourceFile(fileName);
+    if (!sourceFile) return undefined;
+    const node = findNodeAtPosition(ts, sourceFile, position);
+    if (!node || node.kind !== ts.SyntaxKind.ThisKeyword) return undefined;
+    const literal = findEnclosingExtendLiteral(ts, node);
+    if (!literal) return undefined;
+    const owner = getLiteralOwner(ts, literal);
+    const baseName = owner?.parentName;
+    if (!baseName) return undefined;
+    return {
+        kind: ts.ScriptElementKind.variableElement,
+        kindModifiers: "",
+        textSpan: { start: node.getStart(sourceFile), length: node.getEnd() - node.getStart(sourceFile) },
+        displayParts: [
+            { text: "(local var) ", kind: "punctuation" },
+            { text: "this", kind: "keyword" },
+            { text: ": ", kind: "punctuation" },
+            { text: baseName, kind: "text" },
+        ],
+        documentation: [],
+        tags: [],
+    };
+}
+
+/**
+ * tsserver answers that carry no structural information: `any`, or the bare
+ * initial value (`null`/`undefined`) of a field whose real type only shows up
+ * in assignments the checker can't see from the hovered position. The plugin
+ * gets a chance to improve on these before they are returned as-is.
+ */
+export function isWeakQuickInfo(ts: typeof tslib, qi: tslib.QuickInfo): boolean {
+    if (isAnyQuickInfo(ts, qi)) return true;
+    if (!qi.displayParts) return false;
+    const text = qi.displayParts.map((p) => p.text).join("");
+    return /:\s*(?:null|undefined)\s*$/.test(text);
 }
 
 function extractJSDocAsParts(

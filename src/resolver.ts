@@ -498,7 +498,7 @@ export function resolveReceiverToClass(
                 ts, getExtendIndex, literal, memberName, getExpandoIndex
             );
             if (hit?.valueNode) {
-                const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex);
+                const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
                 if (cls) return cls;
             }
         }
@@ -508,7 +508,7 @@ export function resolveReceiverToClass(
         if (ownerClass) {
             const members = collectProtoMembers(getProtoIndex(), ownerClass, memberName);
             for (const m of members) {
-                const cls = extractClassFromInitializer(ts, m.initializer, getExtendIndex, getProtoIndex);
+                const cls = extractClassFromInitializer(ts, m.initializer, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
                 if (cls) return cls;
             }
         }
@@ -538,7 +538,7 @@ export function resolveReceiverToClass(
                     ts, getExtendIndex, entry.literal, fieldName, getExpandoIndex
                 );
                 if (hit?.valueNode) {
-                    const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex);
+                    const cls = extractClassFromInitializer(ts, hit.valueNode, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
                     if (cls) return cls;
                 }
             }
@@ -546,9 +546,16 @@ export function resolveReceiverToClass(
         if (getExpandoIndex) {
             const eHit = expandoHit(getExpandoIndex(), subClass, fieldName);
             if (eHit?.valueNode) {
-                const cls = extractClassFromInitializer(ts, eHit.valueNode, getExtendIndex, getProtoIndex);
+                const cls = extractClassFromInitializer(ts, eHit.valueNode, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
                 if (cls) return cls;
             }
+        }
+        // Fields assigned in constructor bodies (`ctor: function () { this.X = new Y() }`)
+        // live in the proto index, not the extend literal.
+        const protoMember = lookupProtoMember(getProtoIndex(), subClass, fieldName);
+        if (protoMember) {
+            const cls = extractClassFromInitializer(ts, protoMember.initializer, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
+            if (cls) return cls;
         }
         return undefined;
     }
@@ -559,7 +566,7 @@ export function resolveReceiverToClass(
         const entries = getIdentifierIndex().get(receiver.text);
         if (entries) {
             for (const entry of entries) {
-                const cls = extractClassFromInitializer(ts, entry.initializer, getExtendIndex, getProtoIndex);
+                const cls = extractClassFromInitializer(ts, entry.initializer, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
                 if (cls) return cls;
             }
         }
@@ -657,13 +664,17 @@ function findReceiverValueNode(
  *   - `<X>` identifier or dotted name -> X (type-hint convention)
  *   - `new <X>(...)` -> X
  *   - `<X>.create(...)` / `<X>.createWithXxx(...)` etc. -> X (cocos factory convention)
+ *   - multi-segment chain `a.b.c` -> walk it segment-by-segment (needs the
+ *     expando/identifier indices; without them this stays unresolved)
  *   - null / unrecognized -> undefined (caller skips and tries next initializer)
  */
 export function extractClassFromInitializer(
     ts: typeof tslib,
     init: tslib.Expression | undefined,
     getExtendIndex: GetExtendIndex,
-    getProtoIndex?: GetProtoIndex
+    getProtoIndex?: GetProtoIndex,
+    getExpandoIndex?: GetExpandoIndex,
+    getIdentifierIndex?: GetIdentifierIndex
 ): string | undefined {
     if (!init) return undefined;
     if (init.kind === ts.SyntaxKind.NullKeyword) return undefined;
@@ -671,7 +682,7 @@ export function extractClassFromInitializer(
 
     // Unwrap `(expr)` and short-circuit guards like `x || new Foo()`, `x ?? new Foo()`.
     if (ts.isParenthesizedExpression(init)) {
-        return extractClassFromInitializer(ts, init.expression, getExtendIndex, getProtoIndex);
+        return extractClassFromInitializer(ts, init.expression, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex);
     }
     if (ts.isBinaryExpression(init)) {
         const op = init.operatorToken.kind;
@@ -680,15 +691,15 @@ export function extractClassFromInitializer(
             op === ts.SyntaxKind.QuestionQuestionToken
         ) {
             return (
-                extractClassFromInitializer(ts, init.right, getExtendIndex, getProtoIndex) ??
-                extractClassFromInitializer(ts, init.left, getExtendIndex, getProtoIndex)
+                extractClassFromInitializer(ts, init.right, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex) ??
+                extractClassFromInitializer(ts, init.left, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex)
             );
         }
     }
     if (ts.isConditionalExpression(init)) {
         return (
-            extractClassFromInitializer(ts, init.whenTrue, getExtendIndex, getProtoIndex) ??
-            extractClassFromInitializer(ts, init.whenFalse, getExtendIndex, getProtoIndex)
+            extractClassFromInitializer(ts, init.whenTrue, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex) ??
+            extractClassFromInitializer(ts, init.whenFalse, getExtendIndex, getProtoIndex, getExpandoIndex, getIdentifierIndex)
         );
     }
 
@@ -710,6 +721,15 @@ export function extractClassFromInitializer(
             const found = lookupClassName(getExtendIndex(), receiverName, getProtoIndex?.());
             if (found) return found;
         }
+    }
+    // Multi-segment chains like `cityV2Mgr.baseDataInfo.exchangeRuleInfo` are
+    // not a registered class name; walk them segment-by-segment. Nodes shrink
+    // towards the receiver on every recursion, so this terminates.
+    if (ts.isPropertyAccessExpression(init) && direct && direct.indexOf(".") >= 0) {
+        return resolveReceiverToClass(
+            ts, getExtendIndex, getProtoIndex ?? (() => new Map()),
+            init, getExpandoIndex, getIdentifierIndex
+        );
     }
     return undefined;
 }
