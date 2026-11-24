@@ -16,9 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          # npm >= 10.9 才有内置的 OIDC publish 支持
+          # npm >= 11.5.1 才支持 trusted publishing 的 OIDC 交换（node 22 自带的 10.x 只会签 provenance）
           node-version: 22
           registry-url: https://registry.npmjs.org/
+      - run: npm install -g npm@11
       - run: npm ci
       - run: npm test
       - run: npm publish --provenance --access public
